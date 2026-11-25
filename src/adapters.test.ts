@@ -502,7 +502,13 @@ test('adapters locate Native Chat logs via cwd, index, history, and prompt hints
         JSON.stringify({
           timestamp: '2026-11-25T06:17:00Z',
           type: 'session_meta',
-          payload: { id: '01a21159', cwd: '/home/dora/lyfLearn/3dGS/compareExp', model: 'gpt-5-codex' }
+          payload: {
+            id: '01a21159',
+            cwd: '/home/dora/lyfLearn/3dGS/compareExp',
+            model: 'gpt-5-codex',
+            // Large base_instructions (> 64 KB) ensures line-0 truncation still extracts `cwd`.
+            base_instructions: { text: 'x'.repeat(70_000) }
+          }
         }),
         JSON.stringify({
           timestamp: '2026-11-25T06:17:03Z',

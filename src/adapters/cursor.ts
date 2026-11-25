@@ -339,7 +339,7 @@ export class CursorAdapter {
             if (files.length > 0) {
               if (promptHint) {
                 for (const f of files.slice(0, 15)) {
-                  const head = await readHeadUtf8(f.path, 4096)
+                  const head = await readHeadUtf8(f.path, 16_384)
                   if (head.includes(promptHint)) {
                     targetPath = f.path
                     break

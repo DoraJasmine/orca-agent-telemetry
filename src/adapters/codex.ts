@@ -268,17 +268,16 @@ export class CodexAdapter {
       }
 
       // In Orca Native Chat, `orcaSessionId` differs from Codex's internal session UUID; match by cwd + prompt/mtime.
-      // Read up to 32 KB so long AGENTS.md preambles don't hide the user prompt hint.
+      // Read up to 64 KB and fall back to regex `"cwd"` parsing if `session_meta.base_instructions` truncates line 0.
       const cwdMatches: FoundFile[] = []
       for (const candidate of files.slice(0, 25)) {
-        const head = await readHeadUtf8(candidate.path, 32_768)
+        const head = await readHeadUtf8(candidate.path, 65_536)
         if (sid && head.includes(sid)) {
           this.pathByAgentKey.set(cacheKey, candidate.path)
           return candidate.path
         }
         const firstLine = head.split(/\r?\n/)[0] ?? ''
-        const meta = safeJsonParse<{ payload?: { cwd?: string } }>(firstLine)
-        const cwd = normalizePathForCompare(meta?.payload?.cwd)
+        const cwd = normalizePathForCompare(extractCodexHeadCwd(firstLine))
         if (cwd && targetPaths.has(cwd)) {
           if (promptHint && head.includes(promptHint)) {
             this.pathByAgentKey.set(cacheKey, candidate.path)
@@ -301,6 +300,18 @@ export class CodexAdapter {
     }
 
     return null
+  }
+}
+
+function extractCodexHeadCwd(firstLine: string): string | null {
+  const meta = safeJsonParse<{ payload?: { cwd?: string } }>(firstLine)
+  if (meta?.payload?.cwd) return meta.payload.cwd
+  const match = /"cwd"\s*:\s*"((?:\\.|[^"\\])*)"/.exec(firstLine)
+  if (!match) return null
+  try {
+    return JSON.parse(`"${match[1]}"`) as string
+  } catch {
+    return match[1]
   }
 }
 

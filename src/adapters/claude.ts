@@ -304,7 +304,7 @@ export class ClaudeAdapter {
       })
       const wsMatches: FoundFile[] = []
       for (const f of anyFiles.slice(0, 20)) {
-        const head = await readHeadUtf8(f.path, 8192)
+        const head = await readHeadUtf8(f.path, 32_768)
         if (matchesWorkspaceInJsonlHead(head, targetPaths)) {
           if (promptHint && head.includes(promptHint)) {
             this.pathByAgentKey.set(cacheKey, f.path)

@@ -1,0 +1,105 @@
+{
+  "manifestVersion": 2,
+  "id": "orca-agent-telemetry",
+  "name": "Agent Telemetry",
+  "version": "0.1.0",
+  "description": "Right-sidebar and status-bar telemetry for active Orca agents (Context, Tokens, tok/s, Git) across Windows and WSL.",
+  "engines": {
+    "orca": ">=1.4.259"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "orca-agent-telemetry",
+        "title": "Agent Telemetry",
+        "icon": "activity",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "telemetry",
+        "text": "Telemetry",
+        "icon": "activity",
+        "tooltip": "Active Agent Telemetry"
+      }
+    ],
+    "events": [
+      {
+        "on": "workspace.changed"
+      },
+      {
+        "on": "agent.status.changed"
+      },
+      {
+        "on": "workspace.created"
+      },
+      {
+        "on": "workspace.removed"
+      }
+    ],
+    "hooks": [
+      {
+        "event": "agent.prompt.before",
+        "onError": "pass"
+      },
+      {
+        "event": "agent.tool.after",
+        "onError": "pass"
+      }
+    ],
+    "settings": [
+      {
+        "key": "cursorHookEnabled",
+        "title": "Enable Cursor Hook Telemetry",
+        "type": "boolean",
+        "default": false
+      },
+      {
+        "key": "showStatusBar",
+        "title": "Show Status Bar Summary",
+        "type": "boolean",
+        "default": true
+      },
+      {
+        "key": "showEstimatedCost",
+        "title": "Show Estimated API Cost",
+        "type": "boolean",
+        "default": true
+      },
+      {
+        "key": "refreshIntervalMs",
+        "title": "Active Polling Interval (ms)",
+        "type": "number",
+        "default": 2000
+      },
+      {
+        "key": "contextWindowOverride",
+        "title": "Model Context Window Overrides",
+        "type": "string",
+        "default": ""
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "kind": "workspace:read"
+    },
+    {
+      "kind": "agent:read"
+    },
+    {
+      "kind": "history:read"
+    },
+    {
+      "kind": "storage:own"
+    },
+    {
+      "kind": "settings:own"
+    }
+  ]
+}

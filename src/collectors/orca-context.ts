@@ -45,6 +45,7 @@ type CliWorktreeAgent = {
 
 type CliWorktree = {
   worktreeId?: string
+  worktreeInstanceId?: string
   repo?: string
   path?: string
   branch?: string
@@ -204,8 +205,12 @@ export class OrcaContextCollector {
       for (const wt of worktrees) {
         let score = 0
         if (focused.workspaceId && wt.worktreeId) {
-          if (wt.worktreeId === focused.workspaceId) score += 100
-          else if (wt.worktreeId.includes(focused.workspaceId) || focused.workspaceId.includes(wt.worktreeId)) {
+          if (wt.worktreeId === focused.workspaceId || wt.worktreeInstanceId === focused.workspaceId) {
+            score += 100
+          } else if (
+            wt.worktreeId.includes(focused.workspaceId) ||
+            focused.workspaceId.includes(wt.worktreeId)
+          ) {
             score += 70
           }
         }
@@ -241,10 +246,12 @@ export class OrcaContextCollector {
     }
     const res = await wslEnv.execOrcaCli(['environment', 'list', '--json'], { timeoutMs: 3500 })
     if (res.exitCode !== 0 || !res.stdout.trim()) {
-      if (res.stderr.trim()) {
-        this.logger?.logOnce('orca-env-list-err', 'WARN', 'orca-cli', `environment list failed: ${res.stderr.trim()}`)
+      const detail = extractCliFailureDetail(res)
+      if (detail) {
+        this.logger?.logOnce('orca-env-list-err', 'WARN', 'orca-cli', `environment list failed: ${detail}`)
       }
-      this.envListCache = { at: now, items: [] }
+      // Retry within 10s rather than pinning an empty cache for a full minute on startup races.
+      this.envListCache = { at: now - 50_000, items: [] }
       return []
     }
     try {
@@ -253,10 +260,10 @@ export class OrcaContextCollector {
         result?: { environments?: CliEnvironment[] }
       }
       const items = parsed.ok && Array.isArray(parsed.result?.environments) ? parsed.result.environments : []
-      this.envListCache = { at: now, items }
+      this.envListCache = { at: items.length > 0 ? now : now - 50_000, items }
       return items
     } catch {
-      this.envListCache = { at: now, items: [] }
+      this.envListCache = { at: now - 50_000, items: [] }
       return []
     }
   }
@@ -275,8 +282,9 @@ export class OrcaContextCollector {
       timeoutMs: 4500
     })
     if (res.exitCode !== 0 || !res.stdout.trim()) {
-      if (res.stderr.trim()) {
-        this.logger?.logOnce(`orca-wt-ps:${envId}`, 'WARN', 'orca-cli', `worktree ps failed (${envId}): ${res.stderr.trim()}`)
+      const detail = extractCliFailureDetail(res)
+      if (detail) {
+        this.logger?.logOnce(`orca-wt-ps:${envId}`, 'WARN', 'orca-cli', `worktree ps failed (${envId}): ${detail}`)
       }
       return cached?.items ?? []
     }
@@ -403,4 +411,21 @@ async function safeCall<M extends Parameters<OrcaWorkerApi['host']['call']>[0]>(
     }
     return null
   }
+}
+
+function extractCliFailureDetail(res: { stdout: string; stderr: string }): string {
+  const out = res.stdout.trim()
+  if (out.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(out) as { error?: { code?: string; message?: string } }
+      if (parsed.error?.message) {
+        return parsed.error.code
+          ? `${parsed.error.code}: ${parsed.error.message}`
+          : parsed.error.message
+      }
+    } catch {
+      // Fall through to raw stderr/stdout.
+    }
+  }
+  return res.stderr.trim() || out
 }

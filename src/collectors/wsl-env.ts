@@ -22,12 +22,26 @@ function decodeProcessBuffer(raw: string | Buffer): string {
 }
 
 export function buildCleanChildEnv(
-  extra?: Record<string, string | undefined>
+  extra?: Record<string, string | undefined>,
+  deps?: { baseEnv?: Record<string, string | undefined>; homeDir?: string; platform?: string }
 ): Record<string, string | undefined> {
+  const platform = deps?.platform ?? process.platform
   const childEnv: Record<string, string | undefined> = {
-    ...process.env,
+    ...(deps?.baseEnv ?? process.env),
     WSL_UTF8: '1',
     ...extra
+  }
+  // Orca `trusted-worker` processes scrub APPDATA/LOCALAPPDATA/USERPROFILE from `process.env`,
+  // while `os.homedir()` still resolves via Windows user profile APIs. Reconstruct them when missing
+  // so `resources/bin/orca.exe` can locate Orca's runtime metadata directory.
+  if (platform === 'win32') {
+    const home = deps?.homeDir ?? os.homedir()
+    if (home) {
+      if (!childEnv.USERPROFILE) childEnv.USERPROFILE = home
+      if (!childEnv.HOME) childEnv.HOME = home
+      if (!childEnv.APPDATA) childEnv.APPDATA = path.join(home, 'AppData', 'Roaming')
+      if (!childEnv.LOCALAPPDATA) childEnv.LOCALAPPDATA = path.join(home, 'AppData', 'Local')
+    }
   }
   // Electron `trusted-worker` processes inherit ELECTRON_RUN_AS_NODE=1 and CLI wrapper vars;
   // strip them so `resources/bin/orca.exe` executes cleanly as a standalone CLI.

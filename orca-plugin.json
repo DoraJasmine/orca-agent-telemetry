@@ -3,7 +3,7 @@
   "id": "agent-telemetry",
   "publisher": "dorajasmine",
   "name": "Agent Telemetry",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Right-sidebar and status-bar telemetry for active Orca agents (Context, Tokens, tok/s, Git) across Windows and WSL.",
   "engines": {
     "orca": ">=1.4.259"

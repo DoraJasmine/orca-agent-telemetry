@@ -70,6 +70,16 @@ test('parses and resolves WSL UNC and experimental WSL host paths', async () => 
   assert.equal('ORCA_WINDOWS_PACKAGED_CLI_LAUNCHER' in cleanEnv, false)
   assert.equal(cleanEnv.WSL_UTF8, '1')
 
+  const restoredWinEnv = buildCleanChildEnv(undefined, {
+    baseEnv: { SYSTEMROOT: 'C:\\Windows' },
+    homeDir: 'C:\\Users\\alice',
+    platform: 'win32'
+  })
+  assert.equal(restoredWinEnv.USERPROFILE, 'C:\\Users\\alice')
+  assert.equal(restoredWinEnv.HOME, 'C:\\Users\\alice')
+  assert.equal(restoredWinEnv.APPDATA, 'C:\\Users\\alice\\AppData\\Roaming')
+  assert.equal(restoredWinEnv.LOCALAPPDATA, 'C:\\Users\\alice\\AppData\\Local')
+
   assert.deepEqual(parseWslUncPath('\\\\wsl.localhost\\Ubuntu-24.04\\home\\alice\\repo'), {
     distro: 'Ubuntu-24.04',
     linuxPath: '/home/alice/repo'

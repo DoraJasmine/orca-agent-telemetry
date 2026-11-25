@@ -12,7 +12,8 @@ import {
   ingestCursorHookLine,
   ingestCursorTranscriptLine
 } from './adapters/cursor'
-import { createKimiState, ingestKimiLine, KimiAdapter } from './adapters/kimi'
+import { createKimiState, ingestKimiLine, KimiAdapter, parseKimiConfigToml } from './adapters/kimi'
+import { resolveContextWindow } from './adapters/model-windows'
 import { JsonlTailer } from './adapters/tailer'
 import type { AdapterContext } from './adapters/types'
 import { parseGitOutputs } from './collectors/git'
@@ -321,13 +322,23 @@ test('claude parser deduplicates streaming message fragments and respects 1M set
   }
 })
 
-test('kimi parser handles real wire.jsonl time, usageScope, and skips session records', () => {
+test('kimi parser handles real wire.jsonl time, profile.bind modelAlias, usageScope, and config.toml windows', () => {
   const state = createKimiState()
+  ingestKimiLine(
+    JSON.stringify({
+      type: 'profile.bind',
+      agentId: 'main',
+      modelAlias: 'kimi-code/k3.1-pro',
+      systemPrompt: 'You are Kimi Code CLI'
+    }),
+    state,
+    1_793_085_359_000
+  )
   ingestKimiLine(
     JSON.stringify({
       type: 'llm.request',
       time: 1_793_085_360_000,
-      model: 'k3.1-pro'
+      maxTokens: 1_048_576
     }),
     state,
     1_793_085_360_000
@@ -336,7 +347,7 @@ test('kimi parser handles real wire.jsonl time, usageScope, and skips session re
     JSON.stringify({
       type: 'usage.record',
       time: 1_793_085_364_000,
-      model: 'k3.1-pro',
+      model: 'kimi-code/k3.1-pro',
       usageScope: 'turn',
       usage: {
         inputOther: 2_000,
@@ -350,6 +361,16 @@ test('kimi parser handles real wire.jsonl time, usageScope, and skips session re
   )
   ingestKimiLine(
     JSON.stringify({
+      type: 'token_counting.measured',
+      agentId: 'main',
+      tokens: 21_400,
+      time: 1_793_085_364_005
+    }),
+    state,
+    1_793_085_364_005
+  )
+  ingestKimiLine(
+    JSON.stringify({
       type: 'usage.record',
       time: 1_793_085_364_000,
       usageScope: 'session',
@@ -360,9 +381,153 @@ test('kimi parser handles real wire.jsonl time, usageScope, and skips session re
   )
 
   assert.equal(state.turns.length, 1)
-  assert.equal(state.model, 'k3.1-pro')
+  assert.equal(state.model, 'kimi-code/k3.1-pro')
+  assert.equal(state.contextWindow, 1_048_576)
   assert.equal(state.lastContextUsed, 21_400)
   assert.equal(state.turns[0].durationMs, 4_000)
+
+  assert.equal(resolveContextWindow('kimi-code/k3.1-pro', 'kimi', {}), 1_048_576)
+  assert.equal(resolveContextWindow('kimi-code/kimi-for-coding', 'kimi', {}), 1_048_576)
+  assert.equal(resolveContextWindow('kimi-code/kimi-for-coding-highspeed', 'kimi', {}), 262_144)
+  assert.equal(resolveContextWindow('kimi-code/k3-256k', 'kimi', {}), 262_144)
+
+  const parsedToml = parseKimiConfigToml(`
+default_model = "kimi-code/k3.1-pro"
+[models."kimi-code/k3.1-pro"]
+max_context_size = 1048576
+[models."kimi-code/k3-256k"]
+max_context_size = 262144
+`)
+  assert.equal(parsedToml.defaultModel, 'kimi-code/k3.1-pro')
+  assert.equal(parsedToml.contextByModel.get('kimi-code/k3.1-pro'), 1_048_576)
+  assert.equal(parsedToml.contextByModel.get('kimi-code/k3-256k'), 262_144)
+})
+
+test('kimi adapter prefers recent session_1* over older session_9* in session_index and large wd dirs', async () => {
+  const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), 'orca-kimi-match-'))
+  try {
+    const kimiRoot = path.join(homeDir, '.kimi-code')
+    const wdDir = path.join(kimiRoot, 'sessions', 'wd_compareexp_83d83afaf2cf')
+    const oldDir = path.join(wdDir, 'session_9749b3e9-old')
+    const newDir = path.join(wdDir, 'session_1bf33985-new')
+    const delDir = path.join(wdDir, 'session_f9999999-del')
+    for (const d of [oldDir, newDir, delDir]) {
+      await fs.mkdir(path.join(d, 'agents', 'main'), { recursive: true })
+    }
+    await fs.writeFile(
+      path.join(kimiRoot, 'config.toml'),
+      'default_model = "kimi-code/k3.1-pro"\n[models."kimi-code/k3.1-pro"]\nmax_context_size = 1048576\n',
+      'utf8'
+    )
+
+    const oldMs = 1_789_372_774_600
+    const newMs = 1_795_602_233_858
+
+    await fs.writeFile(
+      path.join(oldDir, 'state.json'),
+      JSON.stringify({
+        id: 'session_9749b3e9-old',
+        cwd: '/home/dora/lyfLearn/3dGS/compareExp',
+        title: 'old question',
+        updatedAt: oldMs
+      }),
+      'utf8'
+    )
+    const oldWire = path.join(oldDir, 'agents', 'main', 'wire.jsonl')
+    await fs.writeFile(
+      oldWire,
+      JSON.stringify({
+        type: 'usage.record',
+        model: 'kimi-code/kimi-for-coding',
+        usageScope: 'turn',
+        usage: { inputOther: 25_000, output: 369, inputCacheRead: 0, inputCacheCreation: 0 },
+        time: oldMs
+      }) + '\n',
+      'utf8'
+    )
+    await fs.utimes(oldWire, new Date(oldMs), new Date(oldMs))
+
+    // Deliberately omit `updatedAt` in newDir state.json & bury user prompt past 4 KB.
+    await fs.writeFile(
+      path.join(newDir, 'state.json'),
+      JSON.stringify({
+        id: 'session_1bf33985-new',
+        cwd: '/home/dora/lyfLearn/3dGS/compareExp',
+        title: 'Continue work from the prior Orca session'
+      }),
+      'utf8'
+    )
+    const newWire = path.join(newDir, 'agents', 'main', 'wire.jsonl')
+    await fs.writeFile(
+      newWire,
+      [
+        JSON.stringify({
+          type: 'profile.bind',
+          agentId: 'main',
+          modelAlias: 'kimi-code/k3.1-pro',
+          systemPrompt: 's'.repeat(6_000)
+        }),
+        JSON.stringify({
+          type: 'usage.record',
+          model: 'kimi-code/k3.1-pro',
+          usageScope: 'turn',
+          usage: { inputOther: 13_383, output: 543, inputCacheRead: 58_368, inputCacheCreation: 0 },
+          time: newMs
+        }),
+        JSON.stringify({
+          type: 'token_counting.measured',
+          tokens: 72_294,
+          time: newMs
+        })
+      ].join('\n') + '\n',
+      'utf8'
+    )
+    await fs.utimes(newWire, new Date(newMs), new Date(newMs))
+
+    // session_index rows in production omit `updatedAt` & `title`, and deleted rows are tombstoned.
+    const indexPath = path.join(kimiRoot, 'session_index.jsonl')
+    await fs.writeFile(
+      indexPath,
+      [
+        JSON.stringify({ sessionId: 'session_9749b3e9-old', sessionDir: oldDir, workDir: '/home/dora/lyfLearn/3dGS/compareExp' }),
+        JSON.stringify({ sessionId: 'session_f9999999-del', sessionDir: delDir, workDir: '/home/dora/lyfLearn/3dGS/compareExp' }),
+        JSON.stringify({ sessionId: 'session_f9999999-del', deleted: true }),
+        JSON.stringify({ sessionId: 'session_1bf33985-new', sessionDir: newDir, workDir: '/home/dora/lyfLearn/3dGS/compareExp' })
+      ].join('\n') + '\n',
+      'utf8'
+    )
+
+    const ctx = makeAdapterCtx(homeDir, {
+      key: 'kimi-active',
+      agent: 'kimi',
+      sessionId: 'orca-pane-uuid',
+      stateStartedAt: newMs - 4_000,
+      updatedAt: newMs,
+      prompt: '当前已经做完了实验，你先等等'
+    })
+    const res1 = await new KimiAdapter().collect(ctx)
+    assert.ok(res1)
+    assert.equal(res1.model, 'kimi-code/k3.1-pro')
+    assert.equal(res1.contextUsed, 72_294)
+    assert.equal(res1.contextLimit, 1_048_576)
+
+    // Also verify Tier-2/3 mtime scan without session_index.jsonl across >35 alphabetical dummy dirs.
+    await fs.unlink(indexPath)
+    for (let i = 0; i < 35; i++) {
+      const dummyDir = path.join(wdDir, `session_z${String(i).padStart(2, '0')}`)
+      await fs.mkdir(path.join(dummyDir, 'agents', 'main'), { recursive: true })
+      const dw = path.join(dummyDir, 'agents', 'main', 'wire.jsonl')
+      await fs.writeFile(dw, '{"type":"usage.record","usageScope":"turn","usage":{"inputOther":1}}\n', 'utf8')
+      await fs.utimes(dw, new Date(oldMs - i * 1000), new Date(oldMs - i * 1000))
+    }
+    const res2 = await new KimiAdapter().collect(ctx)
+    assert.ok(res2)
+    assert.equal(res2.model, 'kimi-code/k3.1-pro')
+    assert.equal(res2.contextUsed, 72_294)
+    assert.equal(res2.contextLimit, 1_048_576)
+  } finally {
+    await fs.rm(homeDir, { recursive: true, force: true })
+  }
 })
 
 test('agy parser handles PLANNER_RESPONSE tokens and step completion timing', () => {

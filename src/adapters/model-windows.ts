@@ -59,15 +59,35 @@ const DEFAULT_MODEL_TABLE: readonly [RegExp, ModelSpec][] = [
       cacheWritePerMillion: 2.0
     }
   ],
-  // Kimi models
+  // Kimi models (specific 256k / highspeed variants before 1M k3 / kimi-for-coding defaults)
   [
-    /kimi-k2\.5|kimi-k3|kimi-for-coding|kimi-k2|k3\.\d/i,
+    /(?:k3|k3\.\d)[^,\s]*256k|kimi-for-coding-highspeed|kimi-k2(?:\.5)?/i,
     {
-      contextWindow: 256_000,
+      contextWindow: 262_144,
       inputPerMillion: 0.6,
       outputPerMillion: 2.5,
       cacheReadPerMillion: 0.15,
       cacheWritePerMillion: 0.6
+    }
+  ],
+  [
+    /kimi-k3|kimi-for-coding|k3\.\d|\bk3\b/i,
+    {
+      contextWindow: 1_048_576,
+      inputPerMillion: 0.6,
+      outputPerMillion: 2.5,
+      cacheReadPerMillion: 0.15,
+      cacheWritePerMillion: 0.6
+    }
+  ],
+  [
+    /deepseek-v4|deepseek-flash/i,
+    {
+      contextWindow: 1_000_000,
+      inputPerMillion: 0.28,
+      outputPerMillion: 0.42,
+      cacheReadPerMillion: 0.028,
+      cacheWritePerMillion: 0.28
     }
   ],
   [
@@ -180,7 +200,7 @@ export function resolveContextWindow(
     case 'codex':
       return 258_400
     case 'kimi':
-      return 256_000
+      return 1_048_576
     case 'antigravity':
     case 'agy':
       return 1_000_000

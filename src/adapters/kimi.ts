@@ -20,6 +20,7 @@ import type { AdapterContext, AdapterResult, ParsedTurn } from './types'
 export type KimiParseState = {
   format: 'kimi-wire' | 'kimi-legacy'
   model: string | null
+  contextWindow: number | null
   contextRatioOverride: number | null
   lastContextUsed: number | null
   compactedDetected: boolean
@@ -38,6 +39,7 @@ export function createKimiState(): KimiParseState {
   return {
     format: 'kimi-wire',
     model: null,
+    contextWindow: null,
     contextRatioOverride: null,
     lastContextUsed: null,
     compactedDetected: false,
@@ -69,8 +71,20 @@ export function ingestKimiLine(line: string, state: KimiParseState, observedAtMs
   const maybeModel =
     readString(payload.model) ??
     readString(asRecord(payload.request)?.model) ??
-    readString(obj.model)
+    readString(obj.model) ??
+    readString(payload.modelAlias) ??
+    readString(obj.modelAlias)
   if (maybeModel) state.model = maybeModel
+
+  const maybeContextWindow = readNumber(
+    payload.maxTokens ??
+      obj.maxTokens ??
+      payload.max_context_size ??
+      obj.max_context_size
+  )
+  if (maybeContextWindow >= 32_768) {
+    state.contextWindow = maybeContextWindow
+  }
 
   if (
     type === 'llm.request' ||
@@ -80,6 +94,12 @@ export function ingestKimiLine(line: string, state: KimiParseState, observedAtMs
     type === 'StepBegin'
   ) {
     state.lastRequestAtMs = ts
+    return
+  }
+
+  if (type === 'token_counting.measured' || type === 'token_counting.turn_recorded') {
+    const measured = readNumber(payload.tokens ?? obj.tokens)
+    if (measured > 0) trackCompaction(state, measured)
     return
   }
 
@@ -212,7 +232,16 @@ export class KimiAdapter {
     }
 
     const state = res.state
-    const contextLimit = resolveContextWindow(state.model, 'kimi', ctx.modelOverrides)
+    const cfg = await readKimiConfigLimitsForWire(logPath)
+    const model = state.model ?? cfg?.defaultModel ?? null
+    const cfgLimit = model ? cfg?.contextByModel.get(model) : undefined
+    const effectiveLimit = cfgLimit ?? state.contextWindow
+    const mergedOverrides =
+      model && effectiveLimit && ctx.modelOverrides[model] === undefined
+        ? { ...ctx.modelOverrides, [model]: effectiveLimit }
+        : ctx.modelOverrides
+
+    const contextLimit = resolveContextWindow(model, 'kimi', mergedOverrides) ?? effectiveLimit ?? null
     const contextUsed =
       state.lastContextUsed ??
       (state.contextRatioOverride !== null && contextLimit
@@ -223,7 +252,7 @@ export class KimiAdapter {
       source: state.format,
       sourceLabel: state.format === 'kimi-legacy' ? 'Kimi CLI Wire' : 'Kimi Code Wire',
       logPath,
-      model: state.model,
+      model,
       contextUsed,
       contextLimit,
       contextIsEstimated: false,
@@ -236,12 +265,14 @@ export class KimiAdapter {
   private async locateWireFile(ctx: AdapterContext): Promise<string | null> {
     const cacheKey = ctx.agent.key
     const cached = this.pathByAgentKey.get(cacheKey)
-    if (cached) return cached
+    if (cached && (await fileExists(cached))) return cached
+    if (cached) this.pathByAgentKey.delete(cacheKey)
 
     const sid = ctx.agent.sessionId
     const targetPaths = buildWorkspacePathSet(ctx.workspace)
     const promptHint = buildPromptSnippet(ctx.agent.prompt)
     const targetMs = agentActivityTimestamp(ctx.agent)
+    const wsBaseName = path.basename(ctx.workspace.linuxPath ?? ctx.workspace.windowsPath ?? '').toLowerCase()
 
     const workspaceHashes = new Set<string>()
     for (const p of [ctx.workspace.linuxPath, ctx.workspace.windowsPath, ctx.workspace.rawPath]) {
@@ -252,7 +283,6 @@ export class KimiAdapter {
       if (norm) workspaceHashes.add(createHash('md5').update(norm).digest('hex'))
     }
 
-    // Tier 1: Query `~/.kimi-code/session_index.jsonl` directly if available.
     const kimiHomes: { baseWin: string; distro: string | null }[] = []
     const customHome = process.env.KIMI_CODE_HOME
     if (customHome) kimiHomes.push({ baseWin: customHome, distro: null })
@@ -261,23 +291,31 @@ export class KimiAdapter {
       kimiHomes.push({ baseWin: path.join(root.homeWin, '.kimi'), distro: root.distro })
     }
 
+    const matchOpts: KimiMatchOptions = {
+      sid,
+      targetPaths,
+      workspaceHashes,
+      wsBaseName,
+      promptHint,
+      targetMs
+    }
+
+    // Tier 1: Query `~/.kimi-code/session_index.jsonl` (scoring real wire mtime & state.json).
+    let bestMatch: KimiMatchResult | null = null
     for (const kh of kimiHomes) {
       const indexFile = path.join(kh.baseWin, 'session_index.jsonl')
       if (await fileExists(indexFile)) {
-        const matchedFromIndex = await this.lookupInSessionIndex(
-          indexFile,
-          kh.distro,
-          sid,
-          targetPaths,
-          promptHint,
-          targetMs
-        )
-        if (matchedFromIndex) {
-          this.pathByAgentKey.set(cacheKey, matchedFromIndex)
-          return matchedFromIndex
+        const match = await this.lookupInSessionIndex(indexFile, kh.distro, matchOpts)
+        if (match?.confident) {
+          this.pathByAgentKey.set(cacheKey, match.wirePath)
+          return match.wirePath
         }
+        if (match && !bestMatch) bestMatch = match
       }
+    }
 
+    // Tier 2 & 3: Direct hash lookup & mtime-ordered session scan (avoids alphabetical dir caps).
+    for (const kh of kimiHomes) {
       const sessionsRoot = path.join(kh.baseWin, 'sessions')
       if (!(await fileExists(sessionsRoot))) continue
 
@@ -291,99 +329,23 @@ export class KimiAdapter {
         }
       }
 
-      const files = await findMatchingFiles(
-        sessionsRoot,
-        (name) => name === 'wire.jsonl',
-        { maxDepth: 5, maxDirs: 120, descendingDirs: true }
-      )
-      if (files.length === 0) continue
-
-      if (sid) {
-        const matched = files.find((f) => f.path.includes(sid))
-        if (matched) {
-          this.pathByAgentKey.set(cacheKey, matched.path)
-          return matched.path
-        }
+      const match = await scanSessionsRootByMtime(sessionsRoot, matchOpts)
+      if (match?.confident) {
+        this.pathByAgentKey.set(cacheKey, match.wirePath)
+        return match.wirePath
       }
-
-      // Check state.json in parent session folders or workspace hash for Native Chat matching.
-      const scoredCandidates: { path: string; mtimeMs: number; score: number }[] = []
-      const wsBaseName = path.basename(ctx.workspace.linuxPath ?? ctx.workspace.windowsPath ?? '').toLowerCase()
-
-      for (const f of files.slice(0, 60)) {
-        let score = 0
-        if (wsBaseName && f.path.toLowerCase().includes(`wd_${wsBaseName}_`)) {
-          score += 20
-        }
-        const matchedHash = [...workspaceHashes].some((h) => f.path.includes(h))
-        if (matchedHash) {
-          score += 30
-        }
-
-        const sessionDir = findSessionDirFromWire(f.path)
-        if (sessionDir) {
-          const stateRaw = await readOptionalText(path.join(sessionDir, 'state.json'))
-          if (stateRaw) {
-            const st = safeJsonParse<{
-              id?: string
-              workDir?: string
-              cwd?: string
-              title?: string
-              lastPrompt?: string
-              updatedAt?: number | string
-            }>(stateRaw)
-            const wd = normalizePathForCompare(st?.cwd ?? st?.workDir)
-            if (wd && targetPaths.has(wd)) {
-              score += 50
-            } else if (wd) {
-              continue
-            }
-            if (sid && st?.id === sid) score += 100
-            if (promptHint && ((st?.lastPrompt && st.lastPrompt.includes(promptHint)) || (st?.title && st.title.includes(promptHint)))) {
-              score += 40
-            }
-            const stUpdated = parseIsoTimestampMs(st?.updatedAt)
-            if (targetMs > 0 && stUpdated) {
-              const delta = Math.abs(stUpdated - targetMs)
-              if (delta < 120_000) score += 25
-              else if (delta < 3600_000) score += 10
-            }
-          }
-        }
-
-        if (score > 0 && promptHint) {
-          const head = await readHeadUtf8(f.path, 4096)
-          if (head.includes(promptHint)) score += 35
-        }
-
-        if (score > 0) {
-          scoredCandidates.push({ path: f.path, mtimeMs: f.mtimeMs, score })
-        }
-      }
-
-      if (scoredCandidates.length > 0) {
-        scoredCandidates.sort((a, b) => {
-          if (b.score !== a.score) return b.score - a.score
-          return Math.abs(a.mtimeMs - targetMs) - Math.abs(b.mtimeMs - targetMs)
-        })
-        const best = scoredCandidates[0]
-        this.pathByAgentKey.set(cacheKey, best.path)
-        return best.path
-      }
+      if (match && !bestMatch) bestMatch = match
     }
 
-    return null
+    return bestMatch?.wirePath ?? null
   }
 
   private async lookupInSessionIndex(
     indexFile: string,
     distro: string | null,
-    sid: string | null,
-    targetPaths: Set<string>,
-    promptHint: string | null,
-    targetMs: number
-  ): Promise<string | null> {
-    const tail = await readTailUtf8(indexFile, 128 * 1024)
+    opts: KimiMatchOptions
+  ): Promise<KimiMatchResult | null> {
+    const tail = await readTailUtf8(indexFile, 512 * 1024)
     if (!tail) return null
 
     type IndexRow = {
@@ -394,43 +356,467 @@ export class KimiAdapter {
       cwd?: string
       title?: string
       updatedAt?: string | number
+      deleted?: boolean
     }
 
-    const candidates: { wirePath: string; score: number; updatedAtMs: number }[] = []
-
+    // Collapse append-only index rows by sessionId so deleted sessions are skipped cleanly.
+    const latestBySession = new Map<string, { row: IndexRow; order: number }>()
+    let order = 0
     for (const rawLine of tail.split(/\r?\n/)) {
       const row = safeJsonParse<IndexRow>(rawLine.trim())
-      if (!row || !row.sessionDir) continue
+      if (!row) continue
+      const rowKey = row.sessionId ?? row.id ?? row.sessionDir ?? `row-${order}`
+      if (row.deleted) {
+        latestBySession.delete(rowKey)
+      } else if (row.sessionDir) {
+        latestBySession.set(rowKey, { row, order })
+      }
+      order++
+    }
 
+    type IndexCandidate = {
+      sessionDir: string
+      wirePath: string
+      wireMtimeMs: number
+      isSidMatch: boolean
+      isCwdMatch: boolean
+      indexTitle?: string
+      indexUpdatedAtMs?: number
+      order: number
+    }
+
+    const matchingRows: {
+      row: IndexRow
+      isSidMatch: boolean
+      isCwdMatch: boolean
+      winSessionDir: string
+      order: number
+    }[] = []
+
+    for (const { row, order: rowOrder } of latestBySession.values()) {
       const rowSid = row.sessionId ?? row.id ?? ''
       const rowCwd = normalizePathForCompare(row.workDir ?? row.cwd)
-      const isSidMatch = Boolean(sid && rowSid === sid)
-      const isCwdMatch = Boolean(rowCwd && targetPaths.has(rowCwd))
+      const isSidMatch = Boolean(opts.sid && rowSid === opts.sid)
+      const isCwdMatch = Boolean(rowCwd && opts.targetPaths.has(rowCwd))
       if (!isSidMatch && !isCwdMatch) continue
+      if (!row.sessionDir) continue
 
       const winSessionDir =
         distro && row.sessionDir.startsWith('/')
           ? toWslUncPath(distro, row.sessionDir)
           : row.sessionDir
-
-      const wirePath = await findWireInsideSessionDir(winSessionDir)
-      if (!wirePath) continue
-
-      let score = isSidMatch ? 100 : 10
-      if (promptHint && row.title && row.title.includes(promptHint)) score += 30
-      const updatedAtMs = parseIsoTimestampMs(row.updatedAt) ?? 0
-      if (targetMs > 0 && updatedAtMs > 0) {
-        const delta = Math.abs(updatedAtMs - targetMs)
-        if (delta < 120_000) score += 20
-        else if (delta < 3600_000) score += 5
-      }
-      candidates.push({ wirePath, score, updatedAtMs })
+      matchingRows.push({ row, isSidMatch, isCwdMatch, winSessionDir, order: rowOrder })
     }
 
-    if (candidates.length === 0) return null
-    candidates.sort((a, b) => (b.score !== a.score ? b.score - a.score : b.updatedAtMs - a.updatedAtMs))
-    return candidates[0].wirePath
+    if (matchingRows.length === 0) return null
+
+    const resolved = await Promise.all(
+      matchingRows.map(async (item): Promise<IndexCandidate | null> => {
+        const wirePath = await findWireInsideSessionDir(item.winSessionDir)
+        if (!wirePath) return null
+        const wireMtimeMs = await statMtimeMs(wirePath)
+        if (wireMtimeMs <= 0) return null
+        return {
+          sessionDir: item.winSessionDir,
+          wirePath,
+          wireMtimeMs,
+          isSidMatch: item.isSidMatch,
+          isCwdMatch: item.isCwdMatch,
+          indexTitle: item.row.title,
+          indexUpdatedAtMs: parseIsoTimestampMs(item.row.updatedAt) ?? undefined,
+          order: item.order
+        }
+      })
+    )
+
+    const valid = resolved.filter((c): c is IndexCandidate => c !== null)
+    if (valid.length === 0) return null
+
+    const shortlisted = shortlistCandidates(valid, opts.targetMs, 20)
+    const evaluated = await Promise.all(
+      shortlisted.map((c) =>
+        evaluateKimiCandidate(
+          {
+            sessionDir: c.sessionDir,
+            wirePath: c.wirePath,
+            wireMtimeMs: c.wireMtimeMs,
+            isSidMatch: c.isSidMatch,
+            isCwdMatch: c.isCwdMatch,
+            indexTitle: c.indexTitle,
+            indexUpdatedAtMs: c.indexUpdatedAtMs
+          },
+          opts
+        )
+      )
+    )
+
+    return pickBestKimiCandidate(
+      evaluated.filter((c): c is ScoredKimiCandidate => c !== null),
+      opts.targetMs
+    )
   }
+}
+
+type KimiMatchOptions = {
+  sid: string | null
+  targetPaths: Set<string>
+  workspaceHashes: Set<string>
+  wsBaseName: string
+  promptHint: string | null
+  targetMs: number
+}
+
+type KimiMatchResult = {
+  wirePath: string
+  confident: boolean
+}
+
+type ScoredKimiCandidate = {
+  wirePath: string
+  score: number
+  activityMs: number
+  confident: boolean
+}
+
+function shortlistCandidates<T extends { isSidMatch: boolean; wireMtimeMs: number }>(
+  items: T[],
+  targetMs: number,
+  limit: number
+): T[] {
+  if (items.length <= limit) return items
+  const picked = new Set<T>()
+  const bySid = items.filter((i) => i.isSidMatch)
+  for (const item of bySid) picked.add(item)
+
+  const byClosest = [...items].sort((a, b) =>
+    targetMs > 0
+      ? Math.abs(a.wireMtimeMs - targetMs) - Math.abs(b.wireMtimeMs - targetMs)
+      : b.wireMtimeMs - a.wireMtimeMs
+  )
+  for (const item of byClosest.slice(0, Math.max(limit - 5, 10))) {
+    picked.add(item)
+  }
+
+  const byNewest = [...items].sort((a, b) => b.wireMtimeMs - a.wireMtimeMs)
+  for (const item of byNewest) {
+    if (picked.size >= limit) break
+    picked.add(item)
+  }
+  return [...picked]
+}
+
+async function scanSessionsRootByMtime(
+  sessionsRoot: string,
+  opts: KimiMatchOptions
+): Promise<KimiMatchResult | null> {
+  const projectDirs = await listSubdirsSortedByRelevance(sessionsRoot, opts.workspaceHashes, opts.wsBaseName)
+  const rawCandidates: {
+    sessionDir: string
+    wirePath: string
+    wireMtimeMs: number
+    isSidMatch: boolean
+  }[] = []
+
+  // Prioritize directories matching this workspace first, then fallback to generic dirs.
+  const dirsToInspect = projectDirs.slice(0, 12)
+  let sawMatchedWorkspace = false
+  for (const pDir of dirsToInspect) {
+    if (!pDir.matchedWorkspace && sawMatchedWorkspace && rawCandidates.length > 0) {
+      break
+    }
+    if (pDir.matchedWorkspace) sawMatchedWorkspace = true
+    let entries
+    try {
+      entries = await fs.readdir(pDir.path, { withFileTypes: true })
+    } catch {
+      continue
+    }
+
+    const subdirs = entries.filter((e) => e.isDirectory())
+    const resolvedSubdirs = await Promise.all(
+      subdirs.map(async (sub) => {
+        const sessionDir = path.join(pDir.path, sub.name)
+        const wirePath = await findWireInsideSessionDir(sessionDir)
+        if (!wirePath) return null
+        const wireMtimeMs = await statMtimeMs(wirePath)
+        if (wireMtimeMs <= 0) return null
+        const isSidMatch = Boolean(opts.sid && (sub.name === opts.sid || wirePath.includes(opts.sid)))
+        return { sessionDir, wirePath, wireMtimeMs, isSidMatch }
+      })
+    )
+
+    for (const item of resolvedSubdirs) {
+      if (item) rawCandidates.push(item)
+    }
+  }
+
+  // Fallback for non-standard deeper layouts inside matching workspace directories.
+  if (rawCandidates.length === 0) {
+    for (const pDir of dirsToInspect.slice(0, 4)) {
+      const files = await findMatchingFiles(
+        pDir.path,
+        (name) => name === 'wire.jsonl',
+        { maxDepth: 4, maxDirs: 240, descendingDirs: false }
+      )
+      for (const f of files) {
+        const sessionDir = findSessionDirFromWire(f.path)
+        if (!sessionDir) continue
+        rawCandidates.push({
+          sessionDir,
+          wirePath: f.path,
+          wireMtimeMs: f.mtimeMs,
+          isSidMatch: Boolean(opts.sid && f.path.includes(opts.sid))
+        })
+      }
+    }
+  }
+
+  if (rawCandidates.length === 0) return null
+
+  const shortlisted = shortlistCandidates(rawCandidates, opts.targetMs, 24)
+  const evaluated = await Promise.all(
+    shortlisted.map((c) =>
+      evaluateKimiCandidate(
+        {
+          sessionDir: c.sessionDir,
+          wirePath: c.wirePath,
+          wireMtimeMs: c.wireMtimeMs,
+          isSidMatch: c.isSidMatch,
+          isCwdMatch: false
+        },
+        opts
+      )
+    )
+  )
+
+  return pickBestKimiCandidate(
+    evaluated.filter((c): c is ScoredKimiCandidate => c !== null),
+    opts.targetMs
+  )
+}
+
+async function listSubdirsSortedByRelevance(
+  sessionsRoot: string,
+  workspaceHashes: Set<string>,
+  wsBaseName: string
+): Promise<{ path: string; matchedWorkspace: boolean; mtimeMs: number }[]> {
+  let entries
+  try {
+    entries = await fs.readdir(sessionsRoot, { withFileTypes: true })
+  } catch {
+    return []
+  }
+
+  const dirs = await Promise.all(
+    entries
+      .filter((e) => e.isDirectory())
+      .map(async (e) => {
+        const lower = e.name.toLowerCase()
+        const fullPath = path.join(sessionsRoot, e.name)
+        const matchedWorkspace =
+          workspaceHashes.has(e.name) ||
+          Boolean(wsBaseName && lower.startsWith(`wd_${wsBaseName}_`))
+        const mtimeMs = await statMtimeMs(fullPath)
+        return { path: fullPath, matchedWorkspace, mtimeMs }
+      })
+  )
+
+  dirs.sort((a, b) => {
+    if (a.matchedWorkspace !== b.matchedWorkspace) return a.matchedWorkspace ? -1 : 1
+    return b.mtimeMs - a.mtimeMs
+  })
+  return dirs
+}
+
+async function evaluateKimiCandidate(
+  input: {
+    sessionDir: string
+    wirePath: string
+    wireMtimeMs: number
+    isSidMatch: boolean
+    isCwdMatch: boolean
+    indexTitle?: string
+    indexUpdatedAtMs?: number
+  },
+  opts: KimiMatchOptions
+): Promise<ScoredKimiCandidate | null> {
+  let score = 0
+  let isSidMatch = input.isSidMatch
+  let isCwdMatch = input.isCwdMatch
+  let promptMatched = Boolean(
+    opts.promptHint && input.indexTitle && input.indexTitle.includes(opts.promptHint)
+  )
+
+  if (opts.wsBaseName && input.wirePath.toLowerCase().includes(`wd_${opts.wsBaseName}_`)) {
+    score += 15
+  }
+  if ([...opts.workspaceHashes].some((h) => input.wirePath.includes(h))) {
+    score += 30
+  }
+
+  let stUpdated: number | null = null
+  const stateRaw = await readOptionalText(path.join(input.sessionDir, 'state.json'))
+  if (stateRaw) {
+    const st = safeJsonParse<{
+      id?: string
+      workDir?: string
+      cwd?: string
+      title?: string
+      lastPrompt?: string
+      updatedAt?: number | string
+      archived?: boolean
+    }>(stateRaw)
+    const wd = normalizePathForCompare(st?.cwd ?? st?.workDir)
+    if (wd) {
+      if (!opts.targetPaths.has(wd)) return null
+      isCwdMatch = true
+    }
+    if (opts.sid && st?.id === opts.sid) isSidMatch = true
+    if (
+      opts.promptHint &&
+      ((st?.lastPrompt && st.lastPrompt.includes(opts.promptHint)) ||
+        (st?.title && st.title.includes(opts.promptHint)))
+    ) {
+      promptMatched = true
+    }
+    if (st?.archived) score -= 25
+    stUpdated = parseIsoTimestampMs(st?.updatedAt)
+  }
+
+  if (!isSidMatch && !isCwdMatch && score === 0) return null
+
+  if (isSidMatch) score += 200
+  if (isCwdMatch) score += 50
+
+  if (opts.promptHint && !promptMatched) {
+    const head = await readHeadUtf8(input.wirePath, 16_384)
+    if (head.includes(opts.promptHint)) {
+      promptMatched = true
+    } else {
+      const tail = await readTailUtf8(input.wirePath, 12_288)
+      if (tail.includes(opts.promptHint)) promptMatched = true
+    }
+  }
+  if (promptMatched) score += 80
+
+  const activityMs = Math.max(input.wireMtimeMs, stUpdated ?? 0, input.indexUpdatedAtMs ?? 0)
+  let isFreshMtime = false
+  if (opts.targetMs > 0 && activityMs > 0) {
+    const delta = Math.abs(activityMs - opts.targetMs)
+    if (delta < 120_000) {
+      score += 45
+      isFreshMtime = true
+    } else if (delta < 900_000) {
+      score += 25
+    } else if (delta < 3_600_000) {
+      score += 10
+    } else if (delta > 86_400_000) {
+      score -= 35
+    }
+  }
+
+  return {
+    wirePath: input.wirePath,
+    score,
+    activityMs,
+    confident: isSidMatch || promptMatched || isFreshMtime
+  }
+}
+
+function pickBestKimiCandidate(
+  candidates: ScoredKimiCandidate[],
+  targetMs: number
+): KimiMatchResult | null {
+  if (candidates.length === 0) return null
+  candidates.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score
+    if (targetMs > 0) {
+      const diff = Math.abs(a.activityMs - targetMs) - Math.abs(b.activityMs - targetMs)
+      if (diff !== 0) return diff
+    }
+    return b.activityMs - a.activityMs
+  })
+  const best = candidates[0]
+  return { wirePath: best.wirePath, confident: best.confident }
+}
+
+async function statMtimeMs(targetPath: string): Promise<number> {
+  try {
+    const st = await fs.stat(targetPath)
+    return st.mtimeMs
+  } catch {
+    return 0
+  }
+}
+
+type KimiConfigLimits = {
+  defaultModel: string | null
+  contextByModel: Map<string, number>
+}
+
+const kimiConfigCache = new Map<string, { mtimeMs: number; size: number; limits: KimiConfigLimits }>()
+
+async function readKimiConfigLimitsForWire(wirePath: string): Promise<KimiConfigLimits | null> {
+  const parts = wirePath.split(/[\\/]/)
+  const sessionsIdx = parts.lastIndexOf('sessions')
+  if (sessionsIdx <= 0) return null
+  const configPath = path.join(parts.slice(0, sessionsIdx).join(path.sep), 'config.toml')
+
+  let st
+  try {
+    st = await fs.stat(configPath)
+  } catch {
+    return null
+  }
+
+  const cached = kimiConfigCache.get(configPath)
+  if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+    return cached.limits
+  }
+
+  const raw = await readOptionalText(configPath)
+  if (!raw) return null
+
+  const limits = parseKimiConfigToml(raw)
+  kimiConfigCache.set(configPath, { mtimeMs: st.mtimeMs, size: st.size, limits })
+  return limits
+}
+
+export function parseKimiConfigToml(tomlText: string): KimiConfigLimits {
+  let defaultModel: string | null = null
+  const contextByModel = new Map<string, number>()
+  let activeModelSection: string | null = null
+  let inTopLevel = true
+
+  for (const rawLine of tomlText.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith('#')) continue
+
+    if (line.startsWith('[') && line.endsWith(']')) {
+      inTopLevel = false
+      const modelMatch = line.match(/^\[models\.(?:"([^"]+)"|'([^']+)'|([^\]]+))\]$/)
+      activeModelSection = modelMatch ? (modelMatch[1] ?? modelMatch[2] ?? modelMatch[3]).trim() : null
+      continue
+    }
+
+    if (inTopLevel) {
+      const defMatch = line.match(/^default_model\s*=\s*(?:"([^"]+)"|'([^']+)')/)
+      if (defMatch) defaultModel = (defMatch[1] ?? defMatch[2]).trim()
+      continue
+    }
+
+    if (activeModelSection) {
+      const ctxMatch = line.match(/^max_context_size\s*=\s*([0-9_]+)/)
+      if (ctxMatch) {
+        const parsed = Number.parseInt(ctxMatch[1].replace(/_/g, ''), 10)
+        if (Number.isFinite(parsed) && parsed > 0) {
+          contextByModel.set(activeModelSection, parsed)
+        }
+      }
+    }
+  }
+
+  return { defaultModel, contextByModel }
 }
 
 async function findWireInsideSessionDir(sessionDir: string): Promise<string | null> {

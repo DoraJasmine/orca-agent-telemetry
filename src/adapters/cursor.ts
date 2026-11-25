@@ -208,6 +208,7 @@ export class CursorAdapter {
           contextLimit: limit,
           contextIsEstimated: estContext !== null,
           compactedDetected: false,
+          tokensAvailable: (ctx.orcaSession?.totalTokens ?? 0) > 0,
           turns: [],
           cumulativeOverride: ctx.orcaSession
             ? {
@@ -294,8 +295,13 @@ export class CursorAdapter {
   ): Promise<{ path: string | null; totalChars: number; messageCount: number; tools: ToolCount[] }> {
     const cacheKey = ctx.agent.key
     let targetPath: string | null = this.transcriptPathByAgentKey.get(cacheKey) ?? null
+    if (targetPath && !(await fileExists(targetPath))) {
+      this.transcriptPathByAgentKey.delete(cacheKey)
+      targetPath = null
+    }
 
     if (!targetPath) {
+      let shouldCache = true
       const sid = ctx.agent.sessionId
       const slugHints = buildCursorSlugs([
         ctx.workspace.linuxPath,
@@ -341,7 +347,11 @@ export class CursorAdapter {
                 }
               }
               if (!targetPath) {
-                targetPath = pickClosestFileByTimestamp(files, targetMs)?.path ?? null
+                const best = pickClosestFileByTimestamp(files, targetMs, 60 * 60_000, true)
+                if (best) {
+                  targetPath = best.path
+                  shouldCache = targetMs <= 0 || Math.abs(best.mtimeMs - targetMs) <= 120_000
+                }
               }
               if (targetPath) break
             }
@@ -357,11 +367,12 @@ export class CursorAdapter {
           )
           if (matched[0]) {
             targetPath = matched[0].path
+            shouldCache = true
             break
           }
         }
       }
-      if (targetPath) this.transcriptPathByAgentKey.set(cacheKey, targetPath)
+      if (targetPath && shouldCache) this.transcriptPathByAgentKey.set(cacheKey, targetPath)
     }
 
     if (!targetPath) {

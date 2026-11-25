@@ -17,6 +17,7 @@ export function buildFallbackTelemetry(ctx: AdapterContext): AdapterResult {
     contextLimit,
     contextIsEstimated: false,
     compactedDetected: false,
+    tokensAvailable: totalTokens > 0,
     turns: [],
     cumulativeOverride: session
       ? {

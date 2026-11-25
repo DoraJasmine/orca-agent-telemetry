@@ -68,23 +68,31 @@ export function computeMetrics(input: {
     if (typeof ov.cacheWrite === 'number') cacheWrite = ov.cacheWrite
   }
 
+  const reasoningIncluded =
+    Boolean(adapter.reasoningIncludedInOutput) ||
+    (turns.length > 0 && turns.every((t) => Boolean(t.reasoningIncludedInOutput)))
+
   const inputTotal = ov?.inputTotal ?? inputUncached + cacheRead + cacheWrite
-  const total = ov?.total ?? inputTotal + output + reasoning
+  const total =
+    ov?.total ?? (reasoningIncluded ? inputTotal + output : inputTotal + output + reasoning)
   const turnCount = ov?.turnCount ?? turns.length
+  const tokensAvailable = adapter.tokensAvailable ?? true
 
   const cacheDenominator = inputUncached + cacheRead + cacheWrite
   const cacheHitRatePct =
     cacheDenominator > 0 ? Math.round((cacheRead / cacheDenominator) * 1000) / 10 : null
 
-  const estimatedCostUsd = showEstimatedCost
-    ? estimateCostUsd(adapter.model, {
-        inputUncached,
-        output,
-        reasoning,
-        cacheRead,
-        cacheWrite
-      })
-    : null
+  const estimatedCostUsd =
+    showEstimatedCost && tokensAvailable
+      ? estimateCostUsd(adapter.model, {
+          inputUncached,
+          output,
+          reasoning,
+          reasoningIncludedInOutput: reasoningIncluded,
+          cacheRead,
+          cacheWrite
+        })
+      : null
 
   const contextUsed = adapter.contextUsed
   const contextLimit = adapter.contextLimit
@@ -93,7 +101,7 @@ export function computeMetrics(input: {
       ? Math.min(100, Math.round((contextUsed / contextLimit) * 1000) / 10)
       : null
 
-  const speed = computeSpeed(turns, nowMs)
+  const speed = computeSpeed(turns, nowMs, reasoningIncluded)
 
   return {
     context: {
@@ -114,13 +122,18 @@ export function computeMetrics(input: {
       total,
       cacheHitRatePct,
       estimatedCostUsd,
-      turnCount
+      turnCount,
+      tokensAvailable
     },
     speed
   }
 }
 
-function computeSpeed(turns: readonly ParsedTurn[], nowMs: number): SpeedStats {
+function computeSpeed(
+  turns: readonly ParsedTurn[],
+  nowMs: number,
+  defaultReasoningIncluded: boolean
+): SpeedStats {
   if (turns.length === 0) {
     return {
       turnTokPerSec: null,
@@ -131,8 +144,11 @@ function computeSpeed(turns: readonly ParsedTurn[], nowMs: number): SpeedStats {
     }
   }
 
+  const outputForTurn = (t: ParsedTurn): number =>
+    t.reasoningIncludedInOutput ?? defaultReasoningIncluded ? t.output : t.output + t.reasoning
+
   const lastTurn = turns[turns.length - 1]
-  const lastOut = lastTurn.output + lastTurn.reasoning
+  const lastOut = outputForTurn(lastTurn)
   const lastDur = lastTurn.durationMs ?? null
   const turnTokPerSec =
     lastDur !== null && lastDur >= MIN_RELIABLE_DURATION_MS && lastOut > 0
@@ -147,7 +163,7 @@ function computeSpeed(turns: readonly ParsedTurn[], nowMs: number): SpeedStats {
   const anchorMs = lastTurn.timestampMs ?? nowMs
   for (const t of turns) {
     const dur = t.durationMs ?? null
-    const out = t.output + t.reasoning
+    const out = outputForTurn(t)
     if (dur === null || dur < MIN_RELIABLE_DURATION_MS || out <= 0) continue
 
     sessionOut += out

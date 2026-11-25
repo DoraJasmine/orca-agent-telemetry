@@ -204,23 +204,34 @@ function AgentHeaderCard({ snap }: { snap: TelemetrySnapshot }) {
     )
   }
 
-  const selectOptions = snap.agents.map((a) => {
-    const labelName = a.title ?? a.taskTitle ?? (a.prompt ? a.prompt.slice(0, 24) : null)
-    return {
-      value: a.key,
-      label: `${a.agent}${labelName ? ` · ${labelName}` : ''} (${stateText(a.state)})`
-    }
-  })
+  const activeName = active.title ?? active.taskTitle ?? (active.prompt ? active.prompt.slice(0, 20) : null)
+  const selectOptions = [
+    {
+      value: '__auto__',
+      label: `Auto · ${active.agent}${activeName ? ` · ${activeName}` : ''} (${stateText(active.state)})`
+    },
+    ...snap.agents.map((a) => {
+      const labelName = a.title ?? a.taskTitle ?? (a.prompt ? a.prompt.slice(0, 24) : null)
+      return {
+        value: a.key,
+        label: `${a.agent}${labelName ? ` · ${labelName}` : ''} (${stateText(a.state)})`
+      }
+    })
+  ]
 
   const subLabel = active.taskTitle ?? active.title ?? active.prompt
+  const selectValue =
+    snap.pinnedAgentKey && snap.agents.some((a) => a.key === snap.pinnedAgentKey)
+      ? snap.pinnedAgentKey
+      : '__auto__'
 
   return (
     <Box direction="column" gap="xs" padding="sm" border radius="md" background="card">
-      {snap.agents.length > 1 ? (
+      {snap.agents.length > 1 || snap.pinnedAgentKey ? (
         <Select
           label="Active Agent"
           labelHidden
-          value={active.key}
+          value={selectValue}
           options={selectOptions}
           onChange={(val) => {
             void selectAgent(val)
@@ -294,17 +305,19 @@ function TokensAndSpeedCard({ snap }: { snap: TelemetrySnapshot }) {
   const { tokens, speed, settings, recentTools } = snap
   const turnSpeedText = speed.turnTokPerSec !== null ? `${speed.turnTokPerSec}` : '--'
   const rollingSpeedText = speed.rollingTokPerSec !== null ? `${speed.rollingTokPerSec}` : '--'
+  const countsAvailable = tokens.tokensAvailable !== false
+  const fmtCount = (n: number) => (countsAvailable ? formatTokens(n) : '--')
 
   const items: KeyValueItem[] = [
-    { label: 'Input (New)', value: formatTokens(tokens.inputUncached) },
-    { label: 'Output', value: formatTokens(tokens.output) }
+    { label: 'Input (New)', value: fmtCount(tokens.inputUncached) },
+    { label: 'Output', value: fmtCount(tokens.output) }
   ]
   if (tokens.reasoning > 0) {
-    items.push({ label: 'Reasoning', value: formatTokens(tokens.reasoning) })
+    items.push({ label: 'Reasoning', value: fmtCount(tokens.reasoning) })
   }
   items.push(
-    { label: 'Cache Read', value: formatTokens(tokens.cacheRead) },
-    { label: 'Cache Write', value: formatTokens(tokens.cacheWrite) },
+    { label: 'Cache Read', value: fmtCount(tokens.cacheRead) },
+    { label: 'Cache Write', value: fmtCount(tokens.cacheWrite) },
     {
       label: 'Cache Hit',
       value: tokens.cacheHitRatePct !== null ? `${tokens.cacheHitRatePct.toFixed(1)}%` : '--'
@@ -324,7 +337,7 @@ function TokensAndSpeedCard({ snap }: { snap: TelemetrySnapshot }) {
         <Row gap="xs" align="stretch">
           <MetricTile label="Turn tok/s" value={turnSpeedText} />
           <MetricTile label="Rolling tok/s" value={rollingSpeedText} />
-          <MetricTile label="Total" value={formatTokens(tokens.total)} />
+          <MetricTile label="Total" value={fmtCount(tokens.total)} />
         </Row>
 
         <KeyValue label="Token Breakdown" items={items} />

@@ -26,6 +26,7 @@ type CodexTotals = {
 export type CodexParseState = {
   model: string | null
   contextWindow: number | null
+  reasoningIncludedInOutput: boolean
   lastUsageKey: string | null
   lastTotal: CodexTotals | null
   lastContextUsed: number | null
@@ -39,6 +40,7 @@ export function createCodexState(): CodexParseState {
   return {
     model: null,
     contextWindow: null,
+    reasoningIncludedInOutput: true,
     lastUsageKey: null,
     lastTotal: null,
     lastContextUsed: null,
@@ -93,6 +95,9 @@ export function ingestCodexLine(line: string, state: CodexParseState, observedAt
   const windowSize = readNumber(info.model_context_window)
   if (windowSize > 0) {
     state.contextWindow = windowSize
+  }
+  if (typeof info.last_usage_includes_reasoning === 'boolean') {
+    state.reasoningIncludedInOutput = info.last_usage_includes_reasoning
   }
 
   const totalObj = asRecord(info.total_token_usage)
@@ -168,6 +173,7 @@ export function ingestCodexLine(line: string, state: CodexParseState, observedAt
     inputUncached,
     output: turnOutput,
     reasoning: turnReasoning,
+    reasoningIncludedInOutput: state.reasoningIncludedInOutput,
     cacheRead: turnCached,
     cacheWrite: turnCacheWrite,
     contextUsed,
@@ -217,6 +223,7 @@ export class CodexAdapter {
       contextLimit,
       contextIsEstimated: false,
       compactedDetected: state.compactedDetected,
+      reasoningIncludedInOutput: state.reasoningIncludedInOutput,
       turns: state.turns,
       cumulativeOverride: state.lastTotal
         ? {
@@ -261,9 +268,10 @@ export class CodexAdapter {
       }
 
       // In Orca Native Chat, `orcaSessionId` differs from Codex's internal session UUID; match by cwd + prompt/mtime.
+      // Read up to 32 KB so long AGENTS.md preambles don't hide the user prompt hint.
       const cwdMatches: FoundFile[] = []
       for (const candidate of files.slice(0, 25)) {
-        const head = await readHeadUtf8(candidate.path, 8192)
+        const head = await readHeadUtf8(candidate.path, 32_768)
         if (sid && head.includes(sid)) {
           this.pathByAgentKey.set(cacheKey, candidate.path)
           return candidate.path
@@ -281,9 +289,12 @@ export class CodexAdapter {
       }
 
       if (cwdMatches.length > 0) {
-        const best = pickClosestFileByTimestamp(cwdMatches, targetMs)
+        const best = pickClosestFileByTimestamp(cwdMatches, targetMs, 60 * 60_000, true)
         if (best) {
-          this.pathByAgentKey.set(cacheKey, best.path)
+          // Only permanently cache timestamp fallbacks that are close to this agent's activity window.
+          if (targetMs <= 0 || Math.abs(best.mtimeMs - targetMs) <= 120_000) {
+            this.pathByAgentKey.set(cacheKey, best.path)
+          }
           return best.path
         }
       }

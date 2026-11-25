@@ -1,5 +1,6 @@
 import type { OrcaWorkerApi } from 'orca/worker'
 import { AgyAdapter } from './adapters/agy'
+import { ClaudeAdapter } from './adapters/claude'
 import { CodexAdapter } from './adapters/codex'
 import { CursorAdapter } from './adapters/cursor'
 import { buildFallbackTelemetry } from './adapters/fallback'
@@ -42,11 +43,12 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
   const cursorHook = new CursorHookManager()
 
   const codexAdapter = new CodexAdapter()
+  const claudeAdapter = new ClaudeAdapter()
   const kimiAdapter = new KimiAdapter()
   const agyAdapter = new AgyAdapter()
   const cursorAdapter = new CursorAdapter()
 
-  let selectedAgentKey: string | null = null
+  let pinnedAgentKey: string | null = null
   let panelVisible = false
   let lastCursorHookEventAt: number | null = null
   let latestSnapshot: TelemetrySnapshot | null = null
@@ -97,18 +99,25 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
   }
 
   const pickActiveAgent = (agents: AgentOption[]): AgentOption | null => {
-    if (agents.length === 0) return null
-    if (selectedAgentKey) {
-      const exact = agents.find((a) => a.key === selectedAgentKey)
-      if (exact) return exact
+    if (agents.length === 0) {
+      pinnedAgentKey = null
+      return null
     }
-    // `agents` are already sorted newest-first (`updatedAt` / `stateStartedAt`); prefer working if recent, else newest.
+    if (pinnedAgentKey) {
+      const exact = agents.find((a) => a.key === pinnedAgentKey)
+      if (exact) return exact
+      // Clear manual pin if that agent closed or belongs to another workspace.
+      pinnedAgentKey = null
+    }
+    // Auto-follow mode: `agents` are sorted newest-first (`updatedAt` / `stateStartedAt`).
+    // Prefer a currently working agent if recent (or when top agent is already done).
     const newest = agents[0]
-    const newestAt = Math.max(newest.updatedAt ?? 0, newest.stateStartedAt)
+    if (newest.state === 'working') return newest
     const working = agents.find((a) => a.state === 'working')
     if (working) {
+      const newestAt = Math.max(newest.updatedAt ?? 0, newest.stateStartedAt)
       const workingAt = Math.max(working.updatedAt ?? 0, working.stateStartedAt)
-      if (newestAt - workingAt <= 120_000) return working
+      if (newest.state === 'done' || newestAt - workingAt <= 600_000) return working
     }
     return newest
   }
@@ -170,6 +179,9 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
     const kind = agent.agent.toLowerCase()
     if (kind.includes('codex')) {
       const res = await codexAdapter.collect(adapterCtx)
+      if (res) return res
+    } else if (kind.includes('claude')) {
+      const res = await claudeAdapter.collect(adapterCtx)
       if (res) return res
     } else if (kind.includes('kimi')) {
       const res = await kimiAdapter.collect(adapterCtx)
@@ -268,9 +280,6 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
       })
 
       const activeAgent = pickActiveAgent(orcaCtx.agents)
-      if (activeAgent) {
-        selectedAgentKey = activeAgent.key
-      }
 
       const [homeRoots, git] = await Promise.all([
         wslEnv.getHomeSearchRoots(orcaCtx.workspace),
@@ -325,6 +334,7 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
         workspace: orcaCtx.workspace,
         agents: orcaCtx.agents,
         selectedAgentKey: activeAgent?.key ?? null,
+        pinnedAgentKey,
         activeAgent,
         source: adapter.source,
         sourceLabel: adapter.sourceLabel,
@@ -386,7 +396,7 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
 
   const disposables = [
     orca.events.on('workspace.changed', () => {
-      selectedAgentKey = null
+      pinnedAgentKey = null
       scheduleDebouncedRefresh(true)
     }),
     orca.events.on('workspace.created', () => {
@@ -434,8 +444,10 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
       scheduleDebouncedRefresh(true)
     }),
     orca.panels.handle('telemetry.getSnapshot', async (input) => {
-      if (input?.selectedAgentKey) {
-        selectedAgentKey = input.selectedAgentKey
+      if (input?.selectedAgentKey === '__auto__') {
+        pinnedAgentKey = null
+      } else if (input?.selectedAgentKey) {
+        pinnedAgentKey = input.selectedAgentKey
       }
       if (!input?.forceRefresh && latestSnapshot && Date.now() - latestSnapshot.updatedAt < 500) {
         return latestSnapshot
@@ -443,7 +455,7 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
       return refresh({ force: input?.forceRefresh ?? false })
     }),
     orca.panels.handle('telemetry.selectAgent', async ({ agentKey }) => {
-      selectedAgentKey = agentKey
+      pinnedAgentKey = agentKey === '__auto__' ? null : agentKey
       return refresh({ force: true })
     }),
     orca.panels.handle('telemetry.setPanelVisible', async ({ visible }) => {

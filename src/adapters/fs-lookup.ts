@@ -138,7 +138,8 @@ export function agentActivityTimestamp(agent: AgentOption): number {
 export function pickClosestFileByTimestamp(
   files: readonly FoundFile[],
   targetMs: number,
-  maxDeltaMs = 24 * 60 * 60_000
+  maxDeltaMs = 24 * 60 * 60_000,
+  allowAnyFallback = true
 ): FoundFile | null {
   if (files.length === 0) return null
   if (targetMs <= 0) return files[0]
@@ -152,5 +153,5 @@ export function pickClosestFileByTimestamp(
       best = f
     }
   }
-  return best ?? files[0]
+  return best ?? (allowAnyFallback ? files[0] : null)
 }

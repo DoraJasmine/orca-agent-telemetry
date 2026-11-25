@@ -10,6 +10,7 @@ export type ParsedTurn = {
   inputUncached: number
   output: number
   reasoning: number
+  reasoningIncludedInOutput?: boolean
   cacheRead: number
   cacheWrite: number
   contextUsed: number | null
@@ -26,6 +27,8 @@ export type AdapterResult = {
   contextLimit: number | null
   contextIsEstimated: boolean
   compactedDetected: boolean
+  reasoningIncludedInOutput?: boolean
+  tokensAvailable?: boolean
   turns: ParsedTurn[]
   cumulativeOverride?: Partial<TokenStats> | null
   recentTools: ToolCount[]

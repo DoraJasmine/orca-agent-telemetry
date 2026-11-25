@@ -41,6 +41,7 @@ function makeSnapshot(overrides?: Partial<TelemetrySnapshot>): TelemetrySnapshot
       }
     ],
     selectedAgentKey: 't-1',
+    pinnedAgentKey: null,
     activeAgent: {
       key: 't-1',
       agent: 'codex',
@@ -130,9 +131,18 @@ test('renders WSL context, speed, git telemetry and toggles Cursor hook', async 
       'telemetry.setPanelVisible': () => ({ ok: true }),
       'telemetry.getSnapshot': () => snap,
       'telemetry.selectAgent': ({ agentKey }) => {
+        if (agentKey === '__auto__') {
+          snap = makeSnapshot({
+            selectedAgentKey: 't-1',
+            pinnedAgentKey: null,
+            activeAgent: snap.agents[0]
+          })
+          return snap
+        }
         const nextAgent = snap.agents.find((a) => a.key === agentKey) ?? snap.activeAgent
         snap = makeSnapshot({
           selectedAgentKey: agentKey,
+          pinnedAgentKey: agentKey,
           activeAgent: nextAgent,
           source: 'cursor-transcript',
           sourceLabel: 'Cursor Transcript + Orca'

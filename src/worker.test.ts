@@ -72,10 +72,18 @@ test('worker answers telemetry requests, passes hooks, and updates settings', as
     const snap = await worker.request('telemetry.getSnapshot', { forceRefresh: true })
     assert.equal(snap.workspace.displayName, 'demo-repo')
     assert.equal(snap.activeAgent?.agent, 'kimi')
+    assert.equal(snap.pinnedAgentKey, null)
     assert.equal(snap.source, 'orca-session')
     assert.equal(snap.tokens.total, 12_345)
     assert.equal(snap.git.branch, 'main')
     assert.ok(snap.diagnostics.length > 0)
+
+    const pinned = await worker.request('telemetry.selectAgent', { agentKey: 'term-1' })
+    assert.equal(pinned.pinnedAgentKey, 'term-1')
+
+    const autoResumed = await worker.request('telemetry.selectAgent', { agentKey: '__auto__' })
+    assert.equal(autoResumed.pinnedAgentKey, null)
+    assert.equal(autoResumed.activeAgent?.key, 'term-1')
 
     const hookDecision = await worker.hooks.fire('agent.prompt.before', {
       agent: 'kimi',

@@ -3,6 +3,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { assert, test } from 'orca/testing'
 import { AgyAdapter, createAgyState, ingestAgyLine } from './adapters/agy'
+import { ClaudeAdapter, createClaudeState, ingestClaudeLine } from './adapters/claude'
 import { CodexAdapter, createCodexState, ingestCodexLine } from './adapters/codex'
 import {
   createCursorHookState,
@@ -208,6 +209,116 @@ test('codex parser deduplicates rate-limit token_count events and tracks context
   assert.equal(state.turns[0].durationMs, 5_000)
   assert.equal(state.lastContextUsed, 50_500)
   assert.equal(state.contextWindow, 258_400)
+
+  const metrics = computeMetrics({
+    adapter: {
+      source: 'codex-jsonl',
+      sourceLabel: 'Codex JSONL',
+      logPath: 'rollout.jsonl',
+      model: 'gpt-5-codex',
+      contextUsed: state.lastContextUsed,
+      contextLimit: state.contextWindow,
+      contextIsEstimated: false,
+      compactedDetected: false,
+      reasoningIncludedInOutput: state.reasoningIncludedInOutput,
+      turns: state.turns,
+      recentTools: []
+    },
+    showEstimatedCost: true
+  })
+  // Reasoning (50) is already included inside `output_tokens` (500); must not be double-counted.
+  assert.equal(metrics.tokens.total, 50_500)
+  assert.equal(metrics.speed.turnTokPerSec, 100)
+})
+
+test('claude parser deduplicates streaming message fragments and respects 1M settings window', async () => {
+  const cState = createClaudeState()
+  ingestClaudeLine(
+    JSON.stringify({
+      type: 'user',
+      timestamp: '2026-11-25T07:54:00Z',
+      cwd: '/home/dora/lyfLearn/3dGS/compareExp'
+    }),
+    cState,
+    Date.parse('2026-11-25T07:54:00Z')
+  )
+  const makeChunk = (blockType: string, outTokens: number, ts: string) =>
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: ts,
+      cwd: '/home/dora/lyfLearn/3dGS/compareExp/scripts',
+      message: {
+        id: 'msg_01ABC',
+        model: 'claude-fable-5-2',
+        content: blockType === 'tool_use' ? [{ type: 'tool_use', id: 'tu_1', name: 'Bash', input: {} }] : [{ type: blockType }],
+        usage: {
+          input_tokens: 200,
+          cache_creation_input_tokens: 9_800,
+          cache_read_input_tokens: 570_000,
+          output_tokens: outTokens,
+          output_tokens_details: { thinking_tokens: 95 }
+        }
+      }
+    })
+
+  ingestClaudeLine(makeChunk('thinking', 150, '2026-11-25T07:54:04Z'), cState, 1000)
+  ingestClaudeLine(makeChunk('tool_use', 3_000, '2026-11-25T07:54:10Z'), cState, 2000)
+  ingestClaudeLine(makeChunk('tool_use', 3_000, '2026-11-25T07:54:11Z'), cState, 3000)
+
+  assert.equal(cState.turns.length, 1)
+  assert.equal(cState.turns[0].output, 3_000)
+  assert.equal(cState.turns[0].reasoningIncludedInOutput, true)
+  assert.equal(cState.lastContextUsed, 583_000)
+  assert.equal(cState.tools.get('Bash')?.count, 1)
+
+  const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), 'orca-claude-test-'))
+  try {
+    const claudeDir = path.join(homeDir, '.claude')
+    const projDir = path.join(claudeDir, 'projects', '-home-dora-lyfLearn-3dGS-compareExp')
+    await fs.mkdir(projDir, { recursive: true })
+    await fs.writeFile(
+      path.join(claudeDir, 'settings.json'),
+      JSON.stringify({ env: { CLAUDE_CODE_MAX_CONTEXT_TOKENS: '1000000' } }),
+      'utf8'
+    )
+    await fs.writeFile(
+      path.join(projDir, 'claude-real-uuid.jsonl'),
+      [
+        JSON.stringify({
+          type: 'user',
+          timestamp: '2026-11-25T07:54:00Z',
+          cwd: '/home/dora/lyfLearn/3dGS/compareExp/scripts'
+        }),
+        makeChunk('tool_use', 3_000, '2026-11-25T07:54:10Z')
+      ].join('\n') + '\n',
+      'utf8'
+    )
+    await fs.writeFile(
+      path.join(claudeDir, 'history.jsonl'),
+      JSON.stringify({
+        display: '继续',
+        timestamp: 1_795_592_962_368,
+        project: '/home/dora/lyfLearn/3dGS/compareExp',
+        sessionId: 'claude-real-uuid'
+      }) + '\n',
+      'utf8'
+    )
+
+    const res = await new ClaudeAdapter().collect(
+      makeAdapterCtx(homeDir, {
+        key: 'claude-native',
+        agent: 'claude',
+        sessionId: 'orca-claude-sess',
+        prompt: '继续'
+      })
+    )
+    assert.ok(res)
+    assert.equal(res.source, 'claude-jsonl')
+    assert.equal(res.contextUsed, 583_000)
+    assert.equal(res.contextLimit, 1_000_000)
+  } finally {
+    await fs.rm(homeDir, { recursive: true, force: true })
+  }
 })
 
 test('kimi parser handles real wire.jsonl time, usageScope, and skips session records', () => {

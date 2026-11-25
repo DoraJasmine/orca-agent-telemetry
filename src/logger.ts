@@ -18,6 +18,7 @@ export class TelemetryLogger {
   private readonly logFilePath: string | null
   private readonly ring: string[] = []
   private readonly dedupMap = new Map<string, number>()
+  private readonly infoByKey = new Map<string, string>()
   private writeQueue: Promise<void> = Promise.resolve()
 
   constructor(options?: { sink?: (msg: string) => void; logFilePath?: string | null }) {
@@ -44,10 +45,26 @@ export class TelemetryLogger {
     this.log('DEBUG', scope, message)
   }
 
-  /** Log a message only when its value for `key` changes or the dedup window elapses. */
+  /**
+   * Log a message once per key/content:
+   * - `INFO`/`DEBUG`: logged once until the message for `key` changes (prevents 60s poll spam).
+   * - `WARN`/`ERROR`: re-logged at most once per 60s if unchanged.
+   */
   logOnce(key: string, level: LogLevel, scope: string, message: string): void {
-    const dedupKey = `${key}:${message}`
     const now = Date.now()
+    if (level === 'INFO' || level === 'DEBUG') {
+      const prevMsg = this.infoByKey.get(key)
+      if (prevMsg === message) return
+      this.infoByKey.set(key, message)
+      if (this.infoByKey.size > 300) {
+        const oldestKey = this.infoByKey.keys().next().value
+        if (oldestKey) this.infoByKey.delete(oldestKey)
+      }
+      this.log(level, scope, message)
+      return
+    }
+
+    const dedupKey = `${key}:${message}`
     const prev = this.dedupMap.get(dedupKey)
     if (prev !== undefined && now - prev < DEDUP_WINDOW_MS) {
       return

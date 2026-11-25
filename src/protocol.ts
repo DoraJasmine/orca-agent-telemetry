@@ -5,6 +5,7 @@ export type AgentState = 'working' | 'blocked' | 'waiting' | 'done'
 
 export type TelemetrySource =
   | 'codex-jsonl'
+  | 'claude-jsonl'
   | 'kimi-wire'
   | 'kimi-legacy'
   | 'agy-transcript'
@@ -43,6 +44,7 @@ export type TokenStats = {
   cacheHitRatePct: number | null
   estimatedCostUsd: number | null
   turnCount: number
+  tokensAvailable?: boolean
 }
 
 export type SpeedStats = {
@@ -123,6 +125,7 @@ export type TelemetrySnapshot = {
   workspace: WorkspaceEnv
   agents: AgentOption[]
   selectedAgentKey: string | null
+  pinnedAgentKey?: string | null
   activeAgent: AgentOption | null
   source: TelemetrySource
   sourceLabel: string

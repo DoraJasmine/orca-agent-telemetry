@@ -80,7 +80,17 @@ const DEFAULT_MODEL_TABLE: readonly [RegExp, ModelSpec][] = [
       cacheWritePerMillion: 0.8
     }
   ],
-  // Claude models (via agy / cursor)
+  // Claude models (Claude Code / AGY / Cursor)
+  [
+    /claude.*fable|claude.*5|claude.*1m/i,
+    {
+      contextWindow: 1_000_000,
+      inputPerMillion: 5.0,
+      outputPerMillion: 25.0,
+      cacheReadPerMillion: 0.5,
+      cacheWritePerMillion: 6.25
+    }
+  ],
   [
     /claude.*opus/i,
     {
@@ -174,6 +184,8 @@ export function resolveContextWindow(
     case 'antigravity':
     case 'agy':
       return 1_000_000
+    case 'claude':
+      return 200_000
     case 'cursor':
       return 200_000
     default:
@@ -187,13 +199,16 @@ export function estimateCostUsd(
     inputUncached: number
     output: number
     reasoning: number
+    reasoningIncludedInOutput?: boolean
     cacheRead: number
     cacheWrite: number
   }
 ): number | null {
   const spec = findModelSpec(model)
   if (!spec) return null
-  const outTotal = tokens.output + tokens.reasoning
+  const outTotal = tokens.reasoningIncludedInOutput
+    ? tokens.output
+    : tokens.output + tokens.reasoning
   const usd =
     (tokens.inputUncached * spec.inputPerMillion +
       outTotal * spec.outputPerMillion +

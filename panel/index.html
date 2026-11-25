@@ -1,0 +1,1152 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agent Telemetry</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: var(--orca-background, transparent);
+      --fg: var(--orca-foreground, #18181b);
+      --card: var(--orca-card, rgba(127, 127, 127, 0.05));
+      --muted: var(--orca-muted, rgba(127, 127, 127, 0.09));
+      --muted-fg: var(--orca-muted-foreground, #71717a);
+      --border: var(--orca-border, rgba(127, 127, 127, 0.18));
+      --primary: var(--orca-primary, #2563eb);
+      --primary-fg: var(--orca-primary-foreground, #ffffff);
+      --danger: var(--orca-destructive, #dc2626);
+      --ok: #10b981;
+      --warn: #d97706;
+      --radius: var(--orca-radius, 8px);
+      --font: var(--orca-font-sans, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif);
+      --mono: var(--orca-font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+    }
+
+    html.dark {
+      --card: var(--orca-card, rgba(255, 255, 255, 0.035));
+      --muted: var(--orca-muted, rgba(255, 255, 255, 0.065));
+      --muted-fg: var(--orca-muted-foreground, #a1a1aa);
+      --border: var(--orca-border, rgba(255, 255, 255, 0.1));
+      --ok: #34d399;
+      --warn: #f59e0b;
+    }
+
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: var(--font);
+      font-size: 12px;
+      line-height: 1.45;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .root {
+      padding: 10px 12px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      max-width: 100%;
+    }
+
+    .mono {
+      font-family: var(--mono);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .num {
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Header */
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 2px 2px 4px;
+    }
+
+    .topbar-left {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+
+    .title-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .brand {
+      font-size: 12px;
+      font-weight: 650;
+      letter-spacing: 0.02em;
+      color: var(--fg);
+    }
+
+    .env-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 1px 7px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+      border: 1px solid var(--border);
+      background: var(--muted);
+      color: var(--fg);
+      white-space: nowrap;
+    }
+
+    .env-badge.wsl {
+      border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
+      background: color-mix(in srgb, var(--primary) 12%, transparent);
+      color: color-mix(in srgb, var(--primary) 85%, var(--fg));
+    }
+
+    .ws-sub {
+      font-size: 11px;
+      color: var(--muted-fg);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .icon-btn {
+      appearance: none;
+      width: 26px;
+      height: 26px;
+      border-radius: 7px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--muted-fg);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      flex-shrink: 0;
+      transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+    }
+
+    .icon-btn:hover {
+      background: var(--muted);
+      color: var(--fg);
+    }
+
+    .icon-btn.spinning svg {
+      animation: spin 0.7s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    /* Status dots */
+    .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 999px;
+      flex-shrink: 0;
+      background: var(--muted-fg);
+    }
+    .dot.working {
+      background: var(--primary);
+      box-shadow: 0 0 0 0 color-mix(in srgb, var(--primary) 50%, transparent);
+      animation: pulse 1.6s infinite;
+    }
+    .dot.blocked { background: var(--warn); }
+    .dot.done { background: var(--ok); }
+    .dot.waiting { background: var(--muted-fg); opacity: 0.65; }
+
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--primary) 45%, transparent); }
+      70% { box-shadow: 0 0 0 5px transparent; }
+      100% { box-shadow: 0 0 0 0 transparent; }
+    }
+
+    /* Session switcher strip */
+    .section {
+      border: 1px solid var(--border);
+      background: var(--card);
+      border-radius: calc(var(--radius) + 2px);
+      padding: 10px 11px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+    }
+
+    .section-label {
+      font-size: 10px;
+      font-weight: 650;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted-fg);
+    }
+
+    .micro-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 1px 6px;
+      border-radius: 5px;
+      font-size: 10px;
+      font-weight: 500;
+      border: 1px solid var(--border);
+      background: var(--muted);
+      color: var(--muted-fg);
+      white-space: nowrap;
+    }
+
+    .micro-pill.warn {
+      color: var(--warn);
+      border-color: color-mix(in srgb, var(--warn) 35%, var(--border));
+      background: color-mix(in srgb, var(--warn) 10%, transparent);
+    }
+
+    .micro-pill.ok {
+      color: var(--ok);
+      border-color: color-mix(in srgb, var(--ok) 35%, var(--border));
+      background: color-mix(in srgb, var(--ok) 10%, transparent);
+    }
+
+    .micro-pill.accent {
+      color: color-mix(in srgb, var(--primary) 90%, var(--fg));
+      border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
+      background: color-mix(in srgb, var(--primary) 12%, transparent);
+    }
+
+    .session-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+    }
+
+    .session-pill {
+      appearance: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 4px 8px;
+      max-width: 100%;
+      border-radius: 7px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--muted-fg);
+      font-family: var(--font);
+      font-size: 11px;
+      cursor: pointer;
+      transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+    }
+
+    .session-pill:hover {
+      background: var(--muted);
+      color: var(--fg);
+    }
+
+    .session-pill.active {
+      border-color: color-mix(in srgb, var(--primary) 50%, var(--border));
+      background: color-mix(in srgb, var(--primary) 12%, var(--card));
+      color: var(--fg);
+      font-weight: 600;
+    }
+
+    .pill-agent {
+      font-weight: 600;
+      color: var(--fg);
+      flex-shrink: 0;
+    }
+
+    .pill-title {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 120px;
+    }
+
+    .pill-age {
+      font-size: 10px;
+      opacity: 0.72;
+      flex-shrink: 0;
+    }
+
+    /* Active Agent + Context */
+    .agent-banner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .agent-meta {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .agent-name {
+      font-size: 13px;
+      font-weight: 650;
+      color: var(--fg);
+    }
+
+    .agent-prompt {
+      font-size: 11px;
+      color: var(--muted-fg);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .ctx-hero {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .ctx-pct {
+      font-size: 22px;
+      font-weight: 700;
+      line-height: 1.1;
+      letter-spacing: -0.02em;
+      color: var(--fg);
+    }
+    .ctx-pct.warn { color: var(--warn); }
+    .ctx-pct.danger { color: var(--danger); }
+
+    .ctx-cap {
+      font-size: 11.5px;
+      color: var(--muted-fg);
+    }
+
+    .bar-track {
+      position: relative;
+      height: 6px;
+      border-radius: 999px;
+      background: var(--muted);
+      overflow: hidden;
+    }
+
+    .bar-fill {
+      height: 100%;
+      border-radius: 999px;
+      background: var(--primary);
+      transition: width 0.25s ease;
+    }
+    .bar-fill.warn { background: var(--warn); }
+    .bar-fill.danger { background: var(--danger); }
+
+    .bar-tick {
+      position: absolute;
+      left: 85%;
+      top: 0;
+      bottom: 0;
+      width: 1px;
+      background: var(--border);
+      opacity: 0.9;
+    }
+
+    .ctx-foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 11px;
+      color: var(--muted-fg);
+    }
+
+    /* Tokens & Speed */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 6px;
+    }
+
+    .kpi-tile {
+      border: 1px solid var(--border);
+      background: var(--muted);
+      border-radius: 7px;
+      padding: 6px 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+
+    .kpi-label {
+      font-size: 10px;
+      color: var(--muted-fg);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .kpi-value {
+      font-size: 14px;
+      font-weight: 650;
+      color: var(--fg);
+      white-space: nowrap;
+    }
+
+    .kv-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 5px 12px;
+      padding-top: 2px;
+    }
+
+    .kv-item {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 6px;
+      min-width: 0;
+      padding: 2px 0;
+      border-bottom: 1px dashed color-mix(in srgb, var(--border) 60%, transparent);
+    }
+
+    .kv-k {
+      font-size: 11px;
+      color: var(--muted-fg);
+      white-space: nowrap;
+    }
+
+    .kv-v {
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--fg);
+      white-space: nowrap;
+    }
+
+    /* Git strip */
+    .git-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .branch-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 12px;
+      font-weight: 650;
+      color: var(--fg);
+      min-width: 0;
+    }
+
+    .diff-badges {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      color: var(--muted-fg);
+    }
+
+    .diff-add { color: var(--ok); font-weight: 600; }
+    .diff-del { color: var(--danger); font-weight: 600; }
+
+    .commit-line {
+      font-size: 11px;
+      color: var(--muted-fg);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* Collapsible details */
+    details.fold {
+      border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+      padding-top: 6px;
+    }
+
+    details.fold summary {
+      list-style: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--muted-fg);
+      user-select: none;
+      padding: 2px 0;
+    }
+    details.fold summary::-webkit-details-marker { display: none; }
+    details.fold summary::after {
+      content: '▸';
+      font-size: 10px;
+      transition: transform 0.14s ease;
+    }
+    details.fold[open] summary::after {
+      transform: rotate(90deg);
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      padding-top: 6px;
+    }
+
+    .file-list {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      padding-top: 6px;
+      max-height: 170px;
+      overflow-y: auto;
+    }
+
+    .file-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 11px;
+      padding: 2px 4px;
+      border-radius: 4px;
+    }
+    .file-row:hover { background: var(--muted); }
+    .file-path {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+    .file-stat {
+      flex-shrink: 0;
+      font-size: 10.5px;
+      color: var(--muted-fg);
+    }
+
+    /* Controls */
+    .toggle-list {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      cursor: pointer;
+    }
+
+    .toggle-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+      min-width: 0;
+    }
+
+    .toggle-title {
+      font-size: 11.5px;
+      font-weight: 550;
+      color: var(--fg);
+    }
+
+    .toggle-sub {
+      font-size: 10px;
+      color: var(--muted-fg);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .switch {
+      position: relative;
+      width: 30px;
+      height: 17px;
+      flex-shrink: 0;
+    }
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+      position: absolute;
+    }
+    .slider {
+      position: absolute;
+      inset: 0;
+      border-radius: 999px;
+      background: var(--muted);
+      border: 1px solid var(--border);
+      transition: background 0.15s ease, border-color 0.15s ease;
+      cursor: pointer;
+    }
+    .slider::before {
+      content: '';
+      position: absolute;
+      width: 11px;
+      height: 11px;
+      left: 2px;
+      top: 2px;
+      border-radius: 999px;
+      background: var(--fg);
+      opacity: 0.7;
+      transition: transform 0.15s ease, opacity 0.15s ease, background 0.15s ease;
+    }
+    .switch input:checked + .slider {
+      background: var(--primary);
+      border-color: var(--primary);
+    }
+    .switch input:checked + .slider::before {
+      transform: translateX(13px);
+      background: var(--primary-fg);
+      opacity: 1;
+    }
+
+    /* Diagnostics */
+    .diag-box {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding-top: 6px;
+    }
+    .diag-path {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-size: 10.5px;
+      color: var(--muted-fg);
+    }
+    .copy-btn {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: var(--muted);
+      color: var(--fg);
+      border-radius: 4px;
+      padding: 1px 6px;
+      font-size: 10px;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .log-lines {
+      font-family: var(--mono);
+      font-size: 10px;
+      line-height: 1.4;
+      color: var(--muted-fg);
+      max-height: 130px;
+      overflow-y: auto;
+      padding: 6px;
+      border-radius: 6px;
+      background: var(--muted);
+      word-break: break-all;
+    }
+    .log-line.warn { color: var(--warn); }
+    .log-line.error { color: var(--danger); }
+
+    .notice {
+      border-radius: 7px;
+      padding: 6px 8px;
+      font-size: 11px;
+      border: 1px solid color-mix(in srgb, var(--warn) 40%, var(--border));
+      background: color-mix(in srgb, var(--warn) 10%, transparent);
+      color: var(--fg);
+    }
+    .notice.danger {
+      border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+      background: color-mix(in srgb, var(--danger) 10%, transparent);
+    }
+
+    .empty-state {
+      padding: 14px 8px;
+      text-align: center;
+      color: var(--muted-fg);
+      font-size: 11.5px;
+    }
+
+    .divider {
+      height: 1px;
+      background: color-mix(in srgb, var(--border) 65%, transparent);
+      margin: 2px 0;
+    }
+  </style>
+</head>
+<body>
+  <div id="app" class="root">
+    <div class="empty-state">Reading workspace & agent logs...</div>
+  </div>
+
+  <script>
+    (function () {
+      'use strict';
+
+      var appEl = document.getElementById('app');
+      var state = {
+        snap: null,
+        error: null,
+        refreshing: false,
+        copied: false,
+        open: { tools: false, gitFiles: false, logs: false }
+      };
+
+      function esc(val) {
+        return String(val == null ? '' : val)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;');
+      }
+
+      function fmtTokens(n) {
+        if (typeof n !== 'number' || !isFinite(n)) return '--';
+        if (n >= 1000000) return (n / 1000000).toFixed(2) + 'M';
+        if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+        return String(Math.round(n));
+      }
+
+      function fmtAge(ms) {
+        if (!ms || !isFinite(ms)) return '';
+        var diff = Math.max(0, Date.now() - ms);
+        var sec = Math.floor(diff / 1000);
+        if (sec < 60) return sec + 's';
+        var min = Math.floor(sec / 60);
+        if (min < 60) return min + 'm';
+        var hr = Math.floor(min / 60);
+        if (hr < 24) return hr + 'h';
+        return Math.floor(hr / 24) + 'd';
+      }
+
+      function stateText(s) {
+        if (s === 'working') return 'Working';
+        if (s === 'blocked') return 'Blocked';
+        if (s === 'done') return 'Done';
+        return 'Waiting';
+      }
+
+      function agentLabel(a) {
+        return a.title || a.taskTitle || (a.prompt ? a.prompt.slice(0, 26) : a.agent);
+      }
+
+      function refreshSvg() {
+        return '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>';
+      }
+
+      function branchSvg() {
+        return '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>';
+      }
+
+      function render() {
+        var snap = state.snap;
+        if (!snap) {
+          if (state.error) {
+            appEl.innerHTML =
+              '<div class="topbar">' +
+                '<div class="topbar-left"><div class="brand">Agent Telemetry</div></div>' +
+                '<button class="icon-btn" data-action="refresh" title="Refresh">' + refreshSvg() + '</button>' +
+              '</div>' +
+              '<div class="notice danger">' + esc(state.error) + '</div>';
+          } else {
+            appEl.innerHTML = '<div class="empty-state">Reading workspace & agent logs...</div>';
+          }
+          return;
+        }
+
+        var ws = snap.workspace || {};
+        var isWsl = ws.hostKind === 'wsl';
+        var envText = isWsl
+          ? 'WSL · ' + (ws.wslDistro || 'Linux')
+          : ws.hostKind === 'local'
+            ? 'Local'
+            : ws.hostKind === 'remote'
+              ? 'SSH'
+              : 'Workspace';
+
+        var git = snap.git || {};
+        var branchLabel = git.branch ? ' · ' + git.branch : '';
+        var agents = Array.isArray(snap.agents) ? snap.agents : [];
+        var active = snap.activeAgent;
+        var pinnedKey = snap.pinnedAgentKey || null;
+
+        // 1. Header
+        var html = [];
+        html.push(
+          '<div class="topbar">' +
+            '<div class="topbar-left">' +
+              '<div class="title-row">' +
+                '<span class="brand">Telemetry</span>' +
+                '<span class="env-badge ' + (isWsl ? 'wsl' : '') + '">' +
+                  '<span class="dot ' + (isWsl ? 'done' : 'waiting') + '"></span>' +
+                  esc(envText) +
+                '</span>' +
+              '</div>' +
+              '<div class="ws-sub mono" title="' + esc(ws.linuxPath || ws.windowsPath || ws.rawPath || '') + '">' +
+                esc(ws.displayName || 'No Workspace') + esc(branchLabel) +
+              '</div>' +
+            '</div>' +
+            '<button class="icon-btn ' + (state.refreshing ? 'spinning' : '') + '" data-action="refresh" title="刷新">' +
+              refreshSvg() +
+            '</button>' +
+          '</div>'
+        );
+
+        if (state.error) {
+          html.push('<div class="notice">' + esc(state.error) + '</div>');
+        }
+
+        // 2. Session Switcher Strip
+        if (agents.length > 0) {
+          var modeLabel = pinnedKey ? 'Manual Pin' : 'Auto Follow';
+          var pillsHtml = [
+            '<button class="session-pill ' + (!pinnedKey ? 'active' : '') + '" data-action="select-agent" data-key="__auto__" title="自动跟随活跃或最新会话">' +
+              '<span class="dot ' + (active ? esc(active.state) : 'waiting') + '"></span>' +
+              '<span class="pill-agent">Auto</span>' +
+            '</button>'
+          ];
+          for (var i = 0; i < agents.length; i++) {
+            var ag = agents[i];
+            var isSelected = pinnedKey ? pinnedKey === ag.key : (active && active.key === ag.key && agents.length === 1);
+            var agAge = fmtAge(Math.max(ag.updatedAt || 0, ag.stateStartedAt || 0));
+            pillsHtml.push(
+              '<button class="session-pill ' + (pinnedKey === ag.key ? 'active' : '') + '" data-action="select-agent" data-key="' + esc(ag.key) + '" title="' + esc(ag.agent + ' · ' + agentLabel(ag)) + '">' +
+                '<span class="dot ' + esc(ag.state) + '"></span>' +
+                '<span class="pill-agent">' + esc(ag.agent) + '</span>' +
+                '<span class="pill-title">' + esc(agentLabel(ag)) + '</span>' +
+                (agAge ? '<span class="pill-age mono">' + esc(agAge) + '</span>' : '') +
+              '</button>'
+            );
+          }
+          html.push(
+            '<div class="section">' +
+              '<div class="section-head">' +
+                '<span class="section-label">Sessions (' + agents.length + ')</span>' +
+                '<span class="micro-pill ' + (pinnedKey ? 'warn' : 'accent') + '">' + esc(modeLabel) + '</span>' +
+              '</div>' +
+              '<div class="session-pills">' + pillsHtml.join('') + '</div>' +
+            '</div>'
+          );
+        }
+
+        // 3. Active Agent & Context Window
+        if (!active) {
+          html.push(
+            '<div class="section">' +
+              '<div class="empty-state">Waiting for Kimi, Cursor, Codex, Claude, or AGY in this workspace...</div>' +
+            '</div>'
+          );
+        } else {
+          var ctx = snap.context || {};
+          var pct = typeof ctx.percent === 'number' ? ctx.percent : null;
+          var barTone = pct !== null && pct >= 85 ? 'danger' : pct !== null && pct >= 70 ? 'warn' : '';
+          var estPrefix = ctx.isEstimated ? '~' : '';
+          var pctText = pct !== null ? (estPrefix + pct.toFixed(1) + '%') : '--';
+          var capText = ctx.usedTokens !== null && ctx.usedTokens !== undefined
+            ? estPrefix + fmtTokens(ctx.usedTokens) + ' / ' + (ctx.limitTokens ? fmtTokens(ctx.limitTokens) : '?')
+            : 'Unavailable';
+          var isEstSrc = snap.source === 'orca-session' || snap.source === 'cursor-transcript';
+          var subPrompt = active.taskTitle || active.title || active.prompt || '';
+          var activeAge = fmtAge(active.stateStartedAt);
+
+          html.push(
+            '<div class="section">' +
+              '<div class="agent-banner">' +
+                '<div class="agent-meta">' +
+                  '<span class="dot ' + esc(active.state) + '"></span>' +
+                  '<span class="agent-name">' + esc(active.agent) + '</span>' +
+                  '<span class="micro-pill">' + esc(stateText(active.state)) + (activeAge ? ' · ' + esc(activeAge) : '') + '</span>' +
+                '</div>' +
+                '<span class="micro-pill ' + (isEstSrc ? 'warn' : 'ok') + '">' + esc(snap.sourceLabel || 'Status') + '</span>' +
+              '</div>' +
+              (subPrompt ? '<div class="agent-prompt" title="' + esc(subPrompt) + '">' + esc(subPrompt) + '</div>' : '') +
+              '<div class="divider"></div>' +
+              '<div class="ctx-hero">' +
+                '<span class="ctx-pct mono ' + barTone + '">' + esc(pctText) + '</span>' +
+                '<span class="ctx-cap mono">' + esc(capText) + '</span>' +
+              '</div>' +
+              '<div class="bar-track">' +
+                '<div class="bar-fill ' + barTone + '" style="width:' + Math.min(100, Math.max(0, pct || 0)).toFixed(1) + '%"></div>' +
+                '<div class="bar-tick"></div>' +
+              '</div>' +
+              '<div class="ctx-foot">' +
+                '<span class="mono">Model: ' + esc(ctx.model || 'unknown') + '</span>' +
+                (ctx.compactedDetected ? '<span class="micro-pill warn">Compacted</span>' : '') +
+              '</div>' +
+              (pct !== null && pct >= 85
+                ? '<div class="notice danger">Context over 85% — consider compacting or opening a new session.</div>'
+                : '') +
+            '</div>'
+          );
+
+          // 4. Tokens & Speed
+          var tok = snap.tokens || {};
+          var spd = snap.speed || {};
+          var avail = tok.tokensAvailable !== false;
+          var tv = function (n) { return avail ? fmtTokens(n || 0) : '--'; };
+          var turnRate = spd.turnTokPerSec != null ? (spd.turnTokPerSec + ' t/s') : '--';
+          var rollRate = spd.rollingTokPerSec != null ? (spd.rollingTokPerSec + ' t/s') : '--';
+
+          var kvRows = [
+            ['Input (New)', tv(tok.inputUncached)],
+            ['Output', tv(tok.output)],
+            ['Cache Read', tv(tok.cacheRead)],
+            ['Cache Hit', tok.cacheHitRatePct != null ? tok.cacheHitRatePct.toFixed(1) + '%' : '--'],
+            ['Reasoning', tok.reasoning > 0 ? tv(tok.reasoning) : (avail ? '0' : '--')],
+            ['Cache Write', tv(tok.cacheWrite)],
+            ['Turns', String(tok.turnCount || 0)],
+            ['Est. Cost', snap.settings && snap.settings.showEstimatedCost
+              ? (tok.estimatedCostUsd != null ? ('$' + tok.estimatedCostUsd.toFixed(4)) : '--')
+              : 'Hidden']
+          ];
+
+          var tools = Array.isArray(snap.recentTools) ? snap.recentTools : [];
+          var toolsHtml = '';
+          if (tools.length > 0) {
+            var chips = [];
+            for (var t = 0; t < tools.length; t++) {
+              chips.push('<span class="micro-pill mono">' + esc(tools[t].name) + ' ×' + tools[t].count + '</span>');
+            }
+            toolsHtml =
+              '<details class="fold" data-fold="tools" ' + (state.open.tools ? 'open' : '') + '>' +
+                '<summary>Tools (' + tools.length + ')</summary>' +
+                '<div class="chips">' + chips.join('') + '</div>' +
+              '</details>';
+          }
+
+          html.push(
+            '<div class="section">' +
+              '<div class="section-head"><span class="section-label">Tokens & Speed</span></div>' +
+              '<div class="kpi-grid">' +
+                '<div class="kpi-tile"><span class="kpi-label">Turn Speed</span><span class="kpi-value mono">' + esc(turnRate) + '</span></div>' +
+                '<div class="kpi-tile"><span class="kpi-label">Rolling Avg</span><span class="kpi-value mono">' + esc(rollRate) + '</span></div>' +
+                '<div class="kpi-tile"><span class="kpi-label">Total</span><span class="kpi-value mono">' + esc(tv(tok.total)) + '</span></div>' +
+              '</div>' +
+              '<div class="kv-grid">' +
+                kvRows.map(function (row) {
+                  return '<div class="kv-item"><span class="kv-k">' + esc(row[0]) + '</span><span class="kv-v mono">' + esc(row[1]) + '</span></div>';
+                }).join('') +
+              '</div>' +
+              toolsHtml +
+            '</div>'
+          );
+        }
+
+        // 5. Git & Worktree
+        var gitSrc = git.source === 'wsl-git'
+          ? 'WSL Git'
+          : git.source === 'local-git'
+            ? 'Local Git'
+            : git.source === 'orca-branch'
+              ? 'Branch Only'
+              : 'Unavailable';
+        var abBadge = (git.ahead > 0 || git.behind > 0)
+          ? '<span class="micro-pill accent mono">↑' + git.ahead + ' ↓' + git.behind + '</span>'
+          : '';
+        var gitStats = (git.available && git.source !== 'orca-branch')
+          ? '<div class="git-row">' +
+              '<div class="diff-badges mono">M ' + (git.modified || 0) + ' · A ' + (git.added || 0) + ' · D ' + (git.deleted || 0) + ' · ? ' + (git.untracked || 0) + '</div>' +
+              '<div class="diff-badges mono"><span class="diff-add">+' + (git.linesAdded || 0) + '</span> / <span class="diff-del">-' + (git.linesDeleted || 0) + '</span></div>' +
+            '</div>'
+          : '';
+        var commitHtml = git.lastCommit
+          ? '<div class="commit-line mono" title="' + esc(git.lastCommit.subject) + '">' +
+              esc(git.lastCommit.hash + ' ' + git.lastCommit.subject) +
+              (git.lastCommit.authoredAtMs ? ' · ' + fmtAge(git.lastCommit.authoredAtMs) : '') +
+            '</div>'
+          : '';
+        var gitFiles = Array.isArray(git.files) ? git.files : [];
+        var filesHtml = '';
+        if (gitFiles.length > 0) {
+          var fRows = gitFiles.slice(0, 30).map(function (f) {
+            var statStr = (f.added !== null && f.deleted !== null) ? ('+' + f.added + '/-' + f.deleted) : '';
+            return '<div class="file-row"><span class="file-path mono" title="' + esc(f.path) + '">' + esc(f.status + ' ' + f.path) + '</span>' +
+              (statStr ? '<span class="file-stat mono">' + esc(statStr) + '</span>' : '') + '</div>';
+          }).join('');
+          filesHtml =
+            '<details class="fold" data-fold="gitFiles" ' + (state.open.gitFiles ? 'open' : '') + '>' +
+              '<summary>Changed Files (' + gitFiles.length + ')</summary>' +
+              '<div class="file-list">' + fRows + '</div>' +
+            '</details>';
+        }
+
+        html.push(
+          '<div class="section">' +
+            '<div class="git-row">' +
+              '<div class="branch-chip">' + branchSvg() + '<span class="mono">' + esc(git.branch || 'No branch') + '</span>' + abBadge + '</div>' +
+              '<span class="micro-pill">' + esc(gitSrc) + '</span>' +
+            '</div>' +
+            gitStats +
+            commitHtml +
+            (git.error ? '<div class="notice">' + esc(git.error) + '</div>' : '') +
+            filesHtml +
+          '</div>'
+        );
+
+        // 6. Controls & Diagnostics
+        var ch = snap.cursorHook || {};
+        var cfg = snap.settings || {};
+        var hookEnv = ch.targetEnv === 'wsl' ? ('WSL (' + (ch.distro || 'Linux') + ')') : 'Windows';
+        var hookSub = ch.enabled
+          ? (ch.installed ? ('已挂载 ' + hookEnv + ' ~/.cursor/hooks.json') : (hookEnv + ' 等待写入 ~/.cursor/hooks.json'))
+          : '关闭中：Cursor 使用对话文本与 Orca Session 估算';
+        var logLines = Array.isArray(snap.diagnostics) ? snap.diagnostics.slice(-10) : [];
+        var diagLinesHtml = logLines.length > 0
+          ? logLines.map(function (l) {
+              var cls = l.indexOf('[ERROR]') >= 0 ? 'error' : l.indexOf('[WARN]') >= 0 ? 'warn' : '';
+              return '<div class="log-line ' + cls + '">' + esc(l) + '</div>';
+            }).join('')
+          : '<div class="log-line">No diagnostic logs yet.</div>';
+
+        html.push(
+          '<div class="section">' +
+            '<div class="section-head"><span class="section-label">Controls</span></div>' +
+            '<div class="toggle-list">' +
+              '<label class="toggle-row">' +
+                '<div class="toggle-meta">' +
+                  '<span class="toggle-title">Cursor Hook 精确统计</span>' +
+                  '<span class="toggle-sub" title="' + esc(hookSub) + '">' + esc(hookSub) + '</span>' +
+                '</div>' +
+                '<span class="switch"><input type="checkbox" data-setting="cursorHookEnabled" ' + (ch.enabled ? 'checked' : '') + ' /><span class="slider"></span></span>' +
+              '</label>' +
+              '<label class="toggle-row">' +
+                '<div class="toggle-meta"><span class="toggle-title">底部状态栏简报</span></div>' +
+                '<span class="switch"><input type="checkbox" data-setting="showStatusBar" ' + (cfg.showStatusBar !== false ? 'checked' : '') + ' /><span class="slider"></span></span>' +
+              '</label>' +
+              '<label class="toggle-row">' +
+                '<div class="toggle-meta"><span class="toggle-title">显示 API 估算费用</span></div>' +
+                '<span class="switch"><input type="checkbox" data-setting="showEstimatedCost" ' + (cfg.showEstimatedCost !== false ? 'checked' : '') + ' /><span class="slider"></span></span>' +
+              '</label>' +
+            '</div>' +
+            '<details class="fold" data-fold="logs" ' + (state.open.logs ? 'open' : '') + '>' +
+              '<summary>Diagnostics & Logs</summary>' +
+              '<div class="diag-box">' +
+                '<div class="diag-path"><span class="mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + esc(snap.logPath || 'none') + '">Log: ' + esc(snap.logPath || 'none') + '</span>' +
+                  (snap.logPath ? '<button class="copy-btn" data-action="copy-log">' + (state.copied ? 'Copied' : 'Copy') + '</button>' : '') +
+                '</div>' +
+                '<div class="log-lines">' + diagLinesHtml + '</div>' +
+              '</div>' +
+            '</details>' +
+          '</div>'
+        );
+
+        appEl.innerHTML = html.join('');
+      }
+
+      function applySnapshot(snap) {
+        if (!snap) return;
+        state.snap = snap;
+        state.error = null;
+        render();
+      }
+
+      async function loadSnapshot(forceRefresh) {
+        state.refreshing = Boolean(forceRefresh);
+        if (forceRefresh && state.snap) render();
+        try {
+          var snap = await orca.plugin.request('telemetry.getSnapshot', { forceRefresh: Boolean(forceRefresh) });
+          state.refreshing = false;
+          applySnapshot(snap);
+        } catch (err) {
+          state.refreshing = false;
+          state.error = err && err.message ? err.message : String(err);
+          render();
+        }
+      }
+
+      async function selectAgent(agentKey) {
+        try {
+          var snap = await orca.plugin.request('telemetry.selectAgent', { agentKey: agentKey });
+          applySnapshot(snap);
+        } catch (err) {
+          state.error = err && err.message ? err.message : String(err);
+          render();
+        }
+      }
+
+      // Preserve user fold state across 1.2s polling renders.
+      appEl.addEventListener('toggle', function (e) {
+        var el = e.target;
+        if (el && el.tagName === 'DETAILS' && el.dataset && el.dataset.fold) {
+          state.open[el.dataset.fold] = el.open;
+        }
+      }, true);
+
+      appEl.addEventListener('click', function (e) {
+        var target = e.target && e.target.closest ? e.target.closest('[data-action]') : null;
+        if (!target) return;
+        var action = target.dataset.action;
+        if (action === 'refresh') {
+          void loadSnapshot(true);
+        } else if (action === 'select-agent' && target.dataset.key) {
+          void selectAgent(target.dataset.key);
+        } else if (action === 'copy-log' && state.snap && state.snap.logPath) {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(state.snap.logPath).then(function () {
+              state.copied = true;
+              render();
+              setTimeout(function () { state.copied = false; render(); }, 1200);
+            }).catch(function () {});
+          }
+        }
+      });
+
+      appEl.addEventListener('change', function (e) {
+        var input = e.target;
+        if (!input || input.tagName !== 'INPUT' || !input.dataset || !input.dataset.setting) return;
+        var key = input.dataset.setting;
+        var checked = Boolean(input.checked);
+        if (key === 'cursorHookEnabled') {
+          orca.plugin.request('telemetry.toggleCursorHook', { enabled: checked }).then(applySnapshot).catch(function (err) {
+            state.error = err && err.message ? err.message : String(err);
+            render();
+          });
+        } else {
+          var patch = {};
+          patch[key] = checked;
+          orca.plugin.request('telemetry.updateSettings', patch).then(applySnapshot).catch(function (err) {
+            state.error = err && err.message ? err.message : String(err);
+            render();
+          });
+        }
+      });
+
+      function reportVisibility() {
+        var vis = typeof document.visibilityState === 'string' ? document.visibilityState !== 'hidden' : true;
+        void orca.plugin.request('telemetry.setPanelVisible', { visible: vis }).catch(function () {});
+      }
+
+      orca.plugin.on('telemetry.updated', applySnapshot);
+      orca.on('workspace.changed', function () {
+        void loadSnapshot(false);
+      });
+      document.addEventListener('visibilitychange', reportVisibility);
+      window.addEventListener('beforeunload', function () {
+        void orca.plugin.request('telemetry.setPanelVisible', { visible: false }).catch(function () {});
+      });
+
+      setInterval(function () {
+        if (state.snap && state.open && !state.refreshing) {
+          // Light relative-time tick without hitting worker.
+          render();
+        }
+      }, 30000);
+
+      reportVisibility();
+      void loadSnapshot(false);
+    })();
+  </script>
+</body>
+</html>

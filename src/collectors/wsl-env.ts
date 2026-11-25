@@ -178,9 +178,7 @@ export class WslEnvironmentResolver {
       for (const candidate of candidates) {
         if (await this.pathExists(candidate)) {
           this.orcaBinCache = candidate
-          this.logger?.logOnce('orca-bin', 'INFO', 'orca-cli', 'Resolved Orca CLI binary', {
-            bin: candidate
-          })
+          this.logger?.logOnce('orca-bin', 'INFO', 'orca-cli', `Resolved Orca CLI binary: ${candidate}`)
           return candidate
         }
       }
@@ -189,8 +187,7 @@ export class WslEnvironmentResolver {
         'orca-bin-fallback',
         'WARN',
         'orca-cli',
-        'Falling back to bare "orca" command because packaged resources/bin/orca.exe was not found',
-        { candidates }
+        `Falling back to bare "orca" command because packaged resources/bin/orca.exe was not found (${candidates.join(', ')})`
       )
     }
     this.orcaBinCache = 'orca'
@@ -209,7 +206,8 @@ export class WslEnvironmentResolver {
   async listRunningDistros(force = false): Promise<string[]> {
     if (process.platform !== 'win32') return []
     const now = Date.now()
-    if (!force && this.runningDistrosCache && now - this.runningDistrosCache.at < 15_000) {
+    const maxAge = this.runningDistrosCache?.distros.length ? 60_000 : 10_000
+    if (!force && this.runningDistrosCache && now - this.runningDistrosCache.at < maxAge) {
       return this.runningDistrosCache.distros
     }
     const res = await this.runner('wsl.exe', ['-l', '--running', '-q'], { timeoutMs: 3000 })

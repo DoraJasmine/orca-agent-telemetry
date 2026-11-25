@@ -22,7 +22,8 @@ import type {
 const STATUS_BAR_ID = 'telemetry'
 const ACTIVE_POLL_MIN_MS = 1000
 const ACTIVE_POLL_MAX_MS = 10_000
-const IDLE_POLL_MS = 8000
+const OPEN_IDLE_POLL_MS = 2500
+const HIDDEN_IDLE_POLL_MS = 8000
 
 let activeCleanup: (() => void) | null = null
 
@@ -52,12 +53,19 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
   let panelVisible = false
   let lastCursorHookEventAt: number | null = null
   let latestSnapshot: TelemetrySnapshot | null = null
+  let lastWorkspaceCtx: Awaited<ReturnType<typeof orcaCollector.collect>> | null = null
+  let lastHomeRoots: Awaited<ReturnType<typeof wslEnv.getHomeSearchRoots>> = []
+  let lastGitSnapshot: TelemetrySnapshot['git'] | null = null
   let refreshTimer: ReturnType<typeof setTimeout> | null = null
   let debounceTimer: ReturnType<typeof setTimeout> | null = null
   let inFlightRefresh: Promise<TelemetrySnapshot> | null = null
   let disposed = false
 
   const promptTimings = new Map<string, PromptTimingHint>()
+  const liveAgentActivity = new Map<
+    string,
+    { state: AgentOption['state']; updatedAt: number; stateStartedAt: number }
+  >()
   const autoSyncedHookPaths = new Set<string>()
 
   logger.info('worker', `Activated (Host API ${orca.api.major}.${orca.api.minor})`)
@@ -268,92 +276,142 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
     }
   }
 
-  const refresh = async (options?: { force?: boolean }): Promise<TelemetrySnapshot> => {
-    if (inFlightRefresh && !options?.force) {
+  const applyLiveActivityOverlay = (agents: AgentOption[]): AgentOption[] => {
+    if (liveAgentActivity.size === 0 || agents.length === 0) return agents
+    const next = agents.map((a) => {
+      const hint =
+        liveAgentActivity.get(a.key) ??
+        (a.terminalId ? liveAgentActivity.get(a.terminalId) : undefined) ??
+        (a.sessionId ? liveAgentActivity.get(a.sessionId) : undefined)
+      if (!hint) return a
+      const existingAt = Math.max(a.updatedAt ?? 0, a.stateStartedAt)
+      if (hint.updatedAt <= existingAt && hint.state === a.state) return a
+      return {
+        ...a,
+        state: hint.state,
+        stateStartedAt: hint.updatedAt > a.stateStartedAt ? hint.stateStartedAt : a.stateStartedAt,
+        updatedAt: Math.max(a.updatedAt ?? 0, hint.updatedAt)
+      }
+    })
+    return next.sort((a, b) => {
+      const aTime = Math.max(a.updatedAt ?? 0, a.stateStartedAt)
+      const bTime = Math.max(b.updatedAt ?? 0, b.stateStartedAt)
+      return bTime - aTime
+    })
+  }
+
+  const buildSnapshotForContext = async (
+    cfg: Awaited<ReturnType<typeof readSettings>>,
+    orcaCtx: Awaited<ReturnType<typeof orcaCollector.collect>>,
+    homeRoots: Awaited<ReturnType<typeof wslEnv.getHomeSearchRoots>>,
+    git: TelemetrySnapshot['git']
+  ): Promise<TelemetrySnapshot> => {
+    const agents = applyLiveActivityOverlay(orcaCtx.agents)
+    const activeAgent = pickActiveAgent(agents)
+
+    const adapter = await runAdapter(
+      activeAgent,
+      {
+        workspace: orcaCtx.workspace,
+        homeRoots,
+        cursorHookEnabled: cfg.display.cursorHookEnabled,
+        modelOverrides: cfg.modelOverrides
+      },
+      orcaCtx.sessions
+    )
+
+    const timingHint =
+      activeAgent?.terminalId ? promptTimings.get(activeAgent.terminalId) ?? null : null
+    const metrics = computeMetrics({
+      adapter,
+      showEstimatedCost: cfg.display.showEstimatedCost,
+      timingHint
+    })
+
+    let hookStatus = await cursorHook.inspectStatus(
+      cfg.display.cursorHookEnabled,
+      orcaCtx.workspace,
+      wslEnv,
+      lastCursorHookEventAt
+    )
+    // If Cursor hook is already enabled in settings and the resolved WSL/local target doesn't have
+    // our hook yet (e.g. first boot into WSL after toggling on Windows), auto-sync once per target path.
+    if (
+      cfg.display.cursorHookEnabled &&
+      !hookStatus.installed &&
+      !hookStatus.error &&
+      hookStatus.hooksJsonPath &&
+      (orcaCtx.workspace.hostKind === 'wsl' || orcaCtx.workspace.hostKind === 'local') &&
+      !autoSyncedHookPaths.has(hookStatus.hooksJsonPath)
+    ) {
+      autoSyncedHookPaths.add(hookStatus.hooksJsonPath)
+      hookStatus = await cursorHook.applyToggle(true, orcaCtx.workspace, wslEnv, lastCursorHookEventAt)
+      logger.info(
+        'cursor-hook',
+        `Auto-synced Cursor hook (${hookStatus.targetEnv}, installed=${hookStatus.installed}${hookStatus.error ? `, error=${hookStatus.error}` : ''})`
+      )
+    }
+
+    const snapshot: TelemetrySnapshot = {
+      updatedAt: Date.now(),
+      workspace: orcaCtx.workspace,
+      agents,
+      selectedAgentKey: activeAgent?.key ?? null,
+      pinnedAgentKey,
+      activeAgent,
+      source: adapter.source,
+      sourceLabel: adapter.sourceLabel,
+      logPath: adapter.logPath,
+      context: metrics.context,
+      tokens: metrics.tokens,
+      speed: metrics.speed,
+      recentTools: adapter.recentTools,
+      git,
+      cursorHook: hookStatus,
+      settings: cfg.display,
+      diagnostics: logger.getRecent(15)
+    }
+
+    latestSnapshot = snapshot
+    await updateStatusBar(snapshot)
+    orca.panels.post('telemetry.updated', snapshot)
+    scheduleNextPoll(snapshot, cfg.refreshIntervalMs)
+    return snapshot
+  }
+
+  const refresh = async (options?: {
+    force?: boolean
+    preferCachedCli?: boolean
+  }): Promise<TelemetrySnapshot> => {
+    if (inFlightRefresh && !options?.force && !options?.preferCachedCli) {
       return inFlightRefresh
     }
 
     const work = (async (): Promise<TelemetrySnapshot> => {
       const cfg = await readSettings()
       const orcaCtx = await orcaCollector.collect(orca, wslEnv, {
-        forceSessions: options?.force ?? false
+        forceSessions: options?.force ?? false,
+        preferCachedCli: options?.preferCachedCli ?? false
       })
-
-      const activeAgent = pickActiveAgent(orcaCtx.agents)
+      const sameWorkspace =
+        lastWorkspaceCtx?.workspace.workspaceId === orcaCtx.workspace.workspaceId &&
+        lastWorkspaceCtx?.workspace.linuxPath === orcaCtx.workspace.linuxPath &&
+        lastWorkspaceCtx?.workspace.windowsPath === orcaCtx.workspace.windowsPath
 
       const [homeRoots, git] = await Promise.all([
-        wslEnv.getHomeSearchRoots(orcaCtx.workspace),
-        gitCollector.collect(orcaCtx.workspace, orcaCtx.branch, wslEnv, options?.force ?? false)
+        sameWorkspace && lastHomeRoots.length > 0 && !options?.force
+          ? Promise.resolve(lastHomeRoots)
+          : wslEnv.getHomeSearchRoots(orcaCtx.workspace),
+        sameWorkspace && options?.preferCachedCli && lastGitSnapshot
+          ? Promise.resolve(lastGitSnapshot)
+          : gitCollector.collect(orcaCtx.workspace, orcaCtx.branch, wslEnv, options?.force ?? false)
       ])
 
-      const adapter = await runAdapter(
-        activeAgent,
-        {
-          workspace: orcaCtx.workspace,
-          homeRoots,
-          cursorHookEnabled: cfg.display.cursorHookEnabled,
-          modelOverrides: cfg.modelOverrides
-        },
-        orcaCtx.sessions
-      )
+      lastWorkspaceCtx = orcaCtx
+      lastHomeRoots = homeRoots
+      lastGitSnapshot = git
 
-      const timingHint =
-        activeAgent?.terminalId ? promptTimings.get(activeAgent.terminalId) ?? null : null
-      const metrics = computeMetrics({
-        adapter,
-        showEstimatedCost: cfg.display.showEstimatedCost,
-        timingHint
-      })
-
-      let hookStatus = await cursorHook.inspectStatus(
-        cfg.display.cursorHookEnabled,
-        orcaCtx.workspace,
-        wslEnv,
-        lastCursorHookEventAt
-      )
-      // If Cursor hook is already enabled in settings and the resolved WSL/local target doesn't have
-      // our hook yet (e.g. first boot into WSL after toggling on Windows), auto-sync once per target path.
-      if (
-        cfg.display.cursorHookEnabled &&
-        !hookStatus.installed &&
-        !hookStatus.error &&
-        hookStatus.hooksJsonPath &&
-        (orcaCtx.workspace.hostKind === 'wsl' || orcaCtx.workspace.hostKind === 'local') &&
-        !autoSyncedHookPaths.has(hookStatus.hooksJsonPath)
-      ) {
-        autoSyncedHookPaths.add(hookStatus.hooksJsonPath)
-        hookStatus = await cursorHook.applyToggle(true, orcaCtx.workspace, wslEnv, lastCursorHookEventAt)
-        logger.info(
-          'cursor-hook',
-          `Auto-synced Cursor hook (${hookStatus.targetEnv}, installed=${hookStatus.installed}${hookStatus.error ? `, error=${hookStatus.error}` : ''})`
-        )
-      }
-
-      const snapshot: TelemetrySnapshot = {
-        updatedAt: Date.now(),
-        workspace: orcaCtx.workspace,
-        agents: orcaCtx.agents,
-        selectedAgentKey: activeAgent?.key ?? null,
-        pinnedAgentKey,
-        activeAgent,
-        source: adapter.source,
-        sourceLabel: adapter.sourceLabel,
-        logPath: adapter.logPath,
-        context: metrics.context,
-        tokens: metrics.tokens,
-        speed: metrics.speed,
-        recentTools: adapter.recentTools,
-        git,
-        cursorHook: hookStatus,
-        settings: cfg.display,
-        diagnostics: logger.getRecent(15)
-      }
-
-      latestSnapshot = snapshot
-      await updateStatusBar(snapshot)
-      orca.panels.post('telemetry.updated', snapshot)
-      scheduleNextPoll(snapshot, cfg.refreshIntervalMs)
-      return snapshot
+      return buildSnapshotForContext(cfg, orcaCtx, homeRoots, git)
     })()
 
     inFlightRefresh = work
@@ -376,7 +434,11 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
     if (!shouldPoll) return
 
     const hasWorkingAgent = snapshot?.agents.some((a) => a.state === 'working') ?? false
-    const delay = hasWorkingAgent ? activeMs : IDLE_POLL_MS
+    const delay = hasWorkingAgent
+      ? activeMs
+      : panelVisible
+        ? OPEN_IDLE_POLL_MS
+        : HIDDEN_IDLE_POLL_MS
     refreshTimer = setTimeout(() => {
       if (!disposed) {
         void refresh()
@@ -385,29 +447,50 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
     ;(refreshTimer as { unref?: () => void }).unref?.()
   }
 
-  const scheduleDebouncedRefresh = (force = false): void => {
+  const scheduleDebouncedRefresh = (
+    force = false,
+    delayMs = 50,
+    preferCachedCli = false
+  ): void => {
     if (disposed) return
     if (debounceTimer) clearTimeout(debounceTimer)
     debounceTimer = setTimeout(() => {
       debounceTimer = null
-      if (!disposed) void refresh({ force })
-    }, 150)
+      if (!disposed) void refresh({ force, preferCachedCli })
+    }, delayMs)
   }
 
   const disposables = [
     orca.events.on('workspace.changed', () => {
       pinnedAgentKey = null
-      scheduleDebouncedRefresh(true)
+      if (disposed) return
+      if (debounceTimer) clearTimeout(debounceTimer)
+      debounceTimer = setTimeout(() => {
+        debounceTimer = null
+        if (disposed) return
+        void refresh({ preferCachedCli: true }).then(() => {
+          if (!disposed) void refresh({ force: true })
+        })
+      }, 35)
     }),
     orca.events.on('workspace.created', () => {
-      scheduleDebouncedRefresh(true)
+      scheduleDebouncedRefresh(true, 60)
     }),
     orca.events.on('workspace.removed', () => {
-      scheduleDebouncedRefresh(true)
+      scheduleDebouncedRefresh(true, 60)
     }),
     orca.events.on('agent.status.changed', (payload) => {
+      const now = payload.receivedAt || Date.now()
+      const act = {
+        state: payload.state,
+        updatedAt: now,
+        stateStartedAt: payload.mainAgent?.stateStartedAt ?? now
+      }
+      if (payload.paneKey) liveAgentActivity.set(payload.paneKey, act)
+      if (payload.terminalId) liveAgentActivity.set(payload.terminalId, act)
+      if (payload.sessionId) liveAgentActivity.set(payload.sessionId, act)
+
       if (payload.terminalId) {
-        const now = payload.receivedAt || Date.now()
         const existing = promptTimings.get(payload.terminalId)
         if (payload.state === 'blocked' || payload.state === 'waiting') {
           if (existing && existing.blockedStartedAtMs === null) {
@@ -426,22 +509,29 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
           }
         }
       }
-      scheduleDebouncedRefresh(payload.state === 'done')
+      scheduleDebouncedRefresh(payload.state === 'done', 40)
     }),
     orca.hooks.on('agent.prompt.before', (event, next) => {
+      const now = Date.now()
       promptTimings.set(event.terminalId, {
-        lastPromptAtMs: Date.now(),
+        lastPromptAtMs: now,
         blockedAccumMs: 0,
         blockedStartedAtMs: null
       })
+      liveAgentActivity.set(event.terminalId, {
+        state: 'working',
+        updatedAt: now,
+        stateStartedAt: now
+      })
+      scheduleDebouncedRefresh(false, 40, true)
       return next(event)
     }),
     orca.hooks.on('agent.tool.after', (event, next) => {
-      scheduleDebouncedRefresh(false)
+      scheduleDebouncedRefresh(false, 80)
       return next(event)
     }),
     orca.settings.onDidChange(() => {
-      scheduleDebouncedRefresh(true)
+      scheduleDebouncedRefresh(true, 50)
     }),
     orca.panels.handle('telemetry.getSnapshot', async (input) => {
       if (input?.selectedAgentKey === '__auto__') {
@@ -449,14 +539,18 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
       } else if (input?.selectedAgentKey) {
         pinnedAgentKey = input.selectedAgentKey
       }
-      if (!input?.forceRefresh && latestSnapshot && Date.now() - latestSnapshot.updatedAt < 500) {
+      if (!input?.forceRefresh && latestSnapshot && Date.now() - latestSnapshot.updatedAt < 400) {
         return latestSnapshot
       }
       return refresh({ force: input?.forceRefresh ?? false })
     }),
     orca.panels.handle('telemetry.selectAgent', async ({ agentKey }) => {
       pinnedAgentKey = agentKey === '__auto__' ? null : agentKey
-      return refresh({ force: true })
+      if (lastWorkspaceCtx && lastGitSnapshot) {
+        const cfg = await readSettings()
+        return buildSnapshotForContext(cfg, lastWorkspaceCtx, lastHomeRoots, lastGitSnapshot)
+      }
+      return refresh({ force: false })
     }),
     orca.panels.handle('telemetry.setPanelVisible', async ({ visible }) => {
       panelVisible = visible

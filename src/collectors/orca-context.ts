@@ -72,9 +72,17 @@ export class OrcaContextCollector {
   async collect(
     orca: OrcaWorkerApi,
     wslEnv: WslEnvironmentResolver,
-    options?: { forceSessions?: boolean }
+    options?: { forceSessions?: boolean; preferCachedCli?: boolean }
   ): Promise<OrcaWorkspaceContext> {
     const focused = await safeCall(orca, 'workspace.readContext', undefined, this.logger)
+    if (focused) {
+      this.logger?.logOnce(
+        `focused:${focused.workspaceId ?? ''}:${focused.displayName}`,
+        'INFO',
+        'orca-context',
+        `Focused context: id=${focused.workspaceId ?? 'none'} name="${focused.displayName}" terminals=${focused.terminals.length}`
+      )
+    }
     const listedWorkspaces = orca.host.has('workspace.list')
       ? await safeCall(orca, 'workspace.list', { includeStatus: true }, this.logger)
       : null
@@ -143,7 +151,12 @@ export class OrcaContextCollector {
     let matchedEnvId: string | null = null
 
     if (this.enableCliFallback && focused && (!rawPath || hostAgents.length === 0)) {
-      const envMatch = await this.findInPairedEnvironments(wslEnv, focused, options?.forceSessions ?? false)
+      const envMatch = await this.findInPairedEnvironments(
+        wslEnv,
+        focused,
+        options?.forceSessions ?? false,
+        options?.preferCachedCli ?? false
+      )
       if (envMatch) {
         matchedEnvId = envMatch.env.id
         if (!rawPath && envMatch.worktree.path) {
@@ -193,29 +206,38 @@ export class OrcaContextCollector {
   private async findInPairedEnvironments(
     wslEnv: WslEnvironmentResolver,
     focused: { workspaceId?: string; branch: string; displayName: string },
-    force: boolean
+    force: boolean,
+    preferCachedCli = false
   ): Promise<{ env: CliEnvironment; worktree: CliWorktree } | null> {
-    const envs = await this.listEnvironmentsCached(wslEnv, force)
+    const envs = await this.listEnvironmentsCached(wslEnv, force && !preferCachedCli)
     if (envs.length === 0) return null
 
     const candidates: { env: CliEnvironment; worktree: CliWorktree; score: number }[] = []
 
     for (const env of envs) {
-      const worktrees = await this.readWorktreePsCached(wslEnv, env.id, force)
+      const worktrees = await this.readWorktreePsCached(
+        wslEnv,
+        env.id,
+        force && !preferCachedCli,
+        preferCachedCli
+      )
       for (const wt of worktrees) {
         let score = 0
-        if (focused.workspaceId && wt.worktreeId) {
-          if (wt.worktreeId === focused.workspaceId || wt.worktreeInstanceId === focused.workspaceId) {
-            score += 100
-          } else if (
-            wt.worktreeId.includes(focused.workspaceId) ||
-            focused.workspaceId.includes(wt.worktreeId)
-          ) {
-            score += 70
-          }
+        const exactId =
+          Boolean(focused.workspaceId && wt.worktreeId) &&
+          (wt.worktreeId === focused.workspaceId || wt.worktreeInstanceId === focused.workspaceId)
+        if (exactId) {
+          score += 1000
+        } else if (
+          focused.workspaceId &&
+          wt.worktreeId &&
+          (wt.worktreeId.includes(focused.workspaceId) || focused.workspaceId.includes(wt.worktreeId))
+        ) {
+          // Only grant partial ID credit when display names don't point to a distinct workspace chat.
+          score += !focused.displayName || wt.displayName === focused.displayName ? 120 : 20
         }
         if (focused.displayName) {
-          if (wt.displayName === focused.displayName) score += 40
+          if (wt.displayName === focused.displayName) score += 250
           else if (wt.repo === focused.displayName) score += 25
         }
         if (focused.branch && wt.branch && wt.branch === focused.branch) {
@@ -241,17 +263,23 @@ export class OrcaContextCollector {
     force: boolean
   ): Promise<CliEnvironment[]> {
     const now = Date.now()
-    if (!force && this.envListCache && now - this.envListCache.at < 60_000) {
+    // Paired environments rarely change; cache non-empty list for 5 minutes even across forced refreshes.
+    if (this.envListCache && this.envListCache.items.length > 0 && now - this.envListCache.at < 300_000) {
       return this.envListCache.items
     }
-    const res = await wslEnv.execOrcaCli(['environment', 'list', '--json'], { timeoutMs: 3500 })
+    if (!force && this.envListCache && now - this.envListCache.at < 10_000) {
+      return this.envListCache.items
+    }
+    const res = await wslEnv.execOrcaCli(['environment', 'list', '--json'], { timeoutMs: 5000 })
     if (res.exitCode !== 0 || !res.stdout.trim()) {
       const detail = extractCliFailureDetail(res)
       if (detail) {
         this.logger?.logOnce('orca-env-list-err', 'WARN', 'orca-cli', `environment list failed: ${detail}`)
       }
-      // Retry within 10s rather than pinning an empty cache for a full minute on startup races.
-      this.envListCache = { at: now - 50_000, items: [] }
+      if (this.envListCache && this.envListCache.items.length > 0) {
+        return this.envListCache.items
+      }
+      this.envListCache = { at: now, items: [] }
       return []
     }
     try {
@@ -260,26 +288,27 @@ export class OrcaContextCollector {
         result?: { environments?: CliEnvironment[] }
       }
       const items = parsed.ok && Array.isArray(parsed.result?.environments) ? parsed.result.environments : []
-      this.envListCache = { at: items.length > 0 ? now : now - 50_000, items }
+      this.envListCache = { at: now, items }
       return items
     } catch {
-      this.envListCache = { at: now - 50_000, items: [] }
-      return []
+      return this.envListCache?.items ?? []
     }
   }
 
   private async readWorktreePsCached(
     wslEnv: WslEnvironmentResolver,
     envId: string,
-    force: boolean
+    force: boolean,
+    preferCached = false
   ): Promise<CliWorktree[]> {
     const now = Date.now()
     const cached = this.worktreePsCache.get(envId)
-    if (!force && cached && now - cached.at < 3500) {
+    const maxAgeMs = preferCached ? 15_000 : 2500
+    if (!force && cached && now - cached.at < maxAgeMs) {
       return cached.items
     }
     const res = await wslEnv.execOrcaCli(['worktree', 'ps', '--environment', envId, '--json'], {
-      timeoutMs: 4500
+      timeoutMs: 7500
     })
     if (res.exitCode !== 0 || !res.stdout.trim()) {
       const detail = extractCliFailureDetail(res)

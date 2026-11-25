@@ -42,6 +42,15 @@ test('worker answers telemetry requests, passes hooks, and updates settings', as
             stateStartedAt: 1_700_000_000_000,
             sessionId: 'sess-kimi-1',
             task: { title: 'Test task' }
+          },
+          {
+            terminalId: 'term-2',
+            title: 'codex',
+            agent: 'codex',
+            state: 'waiting',
+            stateStartedAt: 1_699_999_900_000,
+            sessionId: 'sess-codex-2',
+            task: { title: 'Follow-up' }
           }
         ]
       },
@@ -78,8 +87,9 @@ test('worker answers telemetry requests, passes hooks, and updates settings', as
     assert.equal(snap.git.branch, 'main')
     assert.ok(snap.diagnostics.length > 0)
 
-    const pinned = await worker.request('telemetry.selectAgent', { agentKey: 'term-1' })
-    assert.equal(pinned.pinnedAgentKey, 'term-1')
+    const pinned = await worker.request('telemetry.selectAgent', { agentKey: 'term-2' })
+    assert.equal(pinned.pinnedAgentKey, 'term-2')
+    assert.equal(pinned.activeAgent?.agent, 'codex')
 
     const autoResumed = await worker.request('telemetry.selectAgent', { agentKey: '__auto__' })
     assert.equal(autoResumed.pinnedAgentKey, null)

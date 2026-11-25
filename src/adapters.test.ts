@@ -16,6 +16,7 @@ import { JsonlTailer } from './adapters/tailer'
 import type { AdapterContext } from './adapters/types'
 import { parseGitOutputs } from './collectors/git'
 import {
+  buildCleanChildEnv,
   parseWslUncPath,
   toWslUncPath,
   WslEnvironmentResolver
@@ -59,6 +60,10 @@ function makeAdapterCtx(homeDir: string, agent: Partial<AgentOption>, workspace?
 }
 
 test('parses and resolves WSL UNC and experimental WSL host paths', async () => {
+  const cleanEnv = buildCleanChildEnv({ ELECTRON_RUN_AS_NODE: '1' })
+  assert.equal('ELECTRON_RUN_AS_NODE' in cleanEnv, false)
+  assert.equal(cleanEnv.WSL_UTF8, '1')
+
   assert.deepEqual(parseWslUncPath('\\\\wsl.localhost\\Ubuntu-24.04\\home\\alice\\repo'), {
     distro: 'Ubuntu-24.04',
     linuxPath: '/home/alice/repo'

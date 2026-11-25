@@ -21,6 +21,20 @@ function decodeProcessBuffer(raw: string | Buffer): string {
   return raw.toString('utf8').replace(/^\uFEFF/, '')
 }
 
+export function buildCleanChildEnv(
+  extra?: Record<string, string | undefined>
+): Record<string, string | undefined> {
+  const childEnv: Record<string, string | undefined> = {
+    ...process.env,
+    WSL_UTF8: '1',
+    ...extra
+  }
+  // Electron `trusted-worker` processes inherit ELECTRON_RUN_AS_NODE=1; strip it so `orca.exe` runs as CLI.
+  delete childEnv.ELECTRON_RUN_AS_NODE
+  delete childEnv.ELECTRON_NO_ATTACH_CONSOLE
+  return childEnv
+}
+
 export const defaultCommandRunner: CommandRunner = (file, args, options) =>
   new Promise((resolve) => {
     execFile(
@@ -32,11 +46,7 @@ export const defaultCommandRunner: CommandRunner = (file, args, options) =>
         maxBuffer: 4 * 1024 * 1024,
         windowsHide: true,
         encoding: 'buffer',
-        env: {
-          ...process.env,
-          WSL_UTF8: '1',
-          ...options?.env
-        }
+        env: buildCleanChildEnv(options?.env)
       },
       (error, stdout, stderr) => {
         const cleanStdout = decodeProcessBuffer(stdout)

@@ -61,6 +61,7 @@ export class OrcaContextCollector {
   private sessionsCache: { key: string; at: number; items: OrcaSessionSummary[] } | null = null
   private envListCache: { at: number; items: CliEnvironment[] } | null = null
   private worktreePsCache = new Map<string, { at: number; items: CliWorktree[] }>()
+  private readonly unsupportedWorkspaceIds = new Set<string>()
 
   constructor(options?: { logger?: TelemetryLogger; enableCliFallback?: boolean }) {
     this.logger = options?.logger
@@ -106,11 +107,18 @@ export class OrcaContextCollector {
     }[] = []
 
     if (orca.host.has('agents.list')) {
-      let agentsRes = workspaceId
-        ? await safeCall(orca, 'agents.list', { workspaceId }, this.logger, true)
+      const canQueryByWs = Boolean(workspaceId && !this.unsupportedWorkspaceIds.has(workspaceId))
+      let agentsRes = canQueryByWs
+        ? await safeCall(orca, 'agents.list', { workspaceId: workspaceId! }, this.logger, true)
         : null
-      if (!agentsRes) {
-        agentsRes = await safeCall(orca, 'agents.list', undefined, this.logger)
+      if (!agentsRes && workspaceId && canQueryByWs) {
+        this.unsupportedWorkspaceIds.add(workspaceId)
+      }
+      if (!agentsRes && (!workspaceId || !this.unsupportedWorkspaceIds.has(`focused:${workspaceId}`))) {
+        agentsRes = await safeCall(orca, 'agents.list', undefined, this.logger, true)
+        if (!agentsRes && workspaceId) {
+          this.unsupportedWorkspaceIds.add(`focused:${workspaceId}`)
+        }
       }
       rawAgents = agentsRes?.agents ?? []
     }
@@ -385,7 +393,12 @@ async function safeCall<M extends Parameters<OrcaWorkerApi['host']['call']>[0]>(
     return await orca.host.call(method, params)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    if (!(quietSelectorError && msg.includes('selector_not_found'))) {
+    if (
+      !(
+        quietSelectorError &&
+        (msg.includes('selector_not_found') || msg.includes('no workspace has this id'))
+      )
+    ) {
       logger?.logOnce(`host-call:${String(method)}:${msg}`, 'WARN', 'orca-host', `${String(method)} failed: ${msg}`)
     }
     return null

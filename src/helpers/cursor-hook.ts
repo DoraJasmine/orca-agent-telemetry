@@ -14,12 +14,16 @@ import path from 'node:path';
 import os from 'node:os';
 
 const chunks = [];
+let eventHint = process.argv.includes('beforeSubmitPrompt') ? 'beforeSubmitPrompt' : '';
 process.stdin.on('data', (chunk) => chunks.push(chunk));
 process.stdin.on('end', () => {
   try {
     const raw = Buffer.concat(chunks).toString('utf8').trim();
     if (raw) {
       const payload = JSON.parse(raw);
+      if (!eventHint && payload && typeof payload.hook_event_name === 'string') {
+        eventHint = payload.hook_event_name;
+      }
       const outDir = path.join(os.homedir(), '.orca-telemetry');
       fs.mkdirSync(outDir, { recursive: true });
       const spoolPath = path.join(outDir, 'cursor-usage.jsonl');
@@ -29,7 +33,7 @@ process.stdin.on('end', () => {
   } catch {
     // Never fail Cursor's lifecycle hook.
   }
-  process.stdout.write('{}');
+  process.stdout.write(eventHint === 'beforeSubmitPrompt' ? '{"continue":true}\\n' : '{}\\n');
 });
 process.stdin.resume();
 `
@@ -77,7 +81,10 @@ export function mergeCursorHooksJson(
   for (const eventName of events) {
     const current = Array.isArray(hooks[eventName]) ? hooks[eventName].filter((e) => !isOurHookEntry(e)) : []
     if (commandToInstall) {
-      current.push({ command: commandToInstall })
+      const cmd = commandToInstall.includes('--event')
+        ? commandToInstall
+        : `${commandToInstall} --event ${eventName}`
+      current.push({ command: cmd, timeout: 5 })
     }
     if (current.length > 0) {
       hooks[eventName] = current

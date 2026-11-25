@@ -56,6 +56,7 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
   let disposed = false
 
   const promptTimings = new Map<string, PromptTimingHint>()
+  const autoSyncedHookPaths = new Set<string>()
 
   logger.info('worker', `Activated (Host API ${orca.api.major}.${orca.api.minor})`)
 
@@ -295,12 +296,29 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
         timingHint
       })
 
-      const hookStatus = await cursorHook.inspectStatus(
+      let hookStatus = await cursorHook.inspectStatus(
         cfg.display.cursorHookEnabled,
         orcaCtx.workspace,
         wslEnv,
         lastCursorHookEventAt
       )
+      // If Cursor hook is already enabled in settings and the resolved WSL/local target doesn't have
+      // our hook yet (e.g. first boot into WSL after toggling on Windows), auto-sync once per target path.
+      if (
+        cfg.display.cursorHookEnabled &&
+        !hookStatus.installed &&
+        !hookStatus.error &&
+        hookStatus.hooksJsonPath &&
+        (orcaCtx.workspace.hostKind === 'wsl' || orcaCtx.workspace.hostKind === 'local') &&
+        !autoSyncedHookPaths.has(hookStatus.hooksJsonPath)
+      ) {
+        autoSyncedHookPaths.add(hookStatus.hooksJsonPath)
+        hookStatus = await cursorHook.applyToggle(true, orcaCtx.workspace, wslEnv, lastCursorHookEventAt)
+        logger.info(
+          'cursor-hook',
+          `Auto-synced Cursor hook (${hookStatus.targetEnv}, installed=${hookStatus.installed}${hookStatus.error ? `, error=${hookStatus.error}` : ''})`
+        )
+      }
 
       const snapshot: TelemetrySnapshot = {
         updatedAt: Date.now(),

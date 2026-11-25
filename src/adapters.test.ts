@@ -369,10 +369,13 @@ test('cursor hook & transcript parsers deduplicate generations and merge hooks.j
   const installed = mergeCursorHooksJson(existingHooks, 'node "/home/u/.orca-telemetry/cursor-hook.mjs"')
   assert.equal(hasTelemetryHookInstalled(installed), true)
   assert.ok(installed.includes('echo user-hook'))
+  assert.ok(installed.includes('--event beforeSubmitPrompt'))
+  assert.ok(installed.includes('--event stop'))
 
   const uninstalled = mergeCursorHooksJson(installed, null)
   assert.equal(hasTelemetryHookInstalled(uninstalled), false)
   assert.ok(uninstalled.includes('echo user-hook'))
+  assert.equal(uninstalled.includes('--event beforeSubmitPrompt'), false)
 })
 
 test('adapters locate Native Chat logs via cwd, index, history, and prompt hints when UUIDs differ', async () => {

@@ -814,7 +814,7 @@
           var pillsHtml = [
             '<button class="session-pill ' + (!pinnedKey ? 'active' : '') + '" data-action="select-agent" data-key="__auto__" title="自动跟随活跃或最新会话">' +
               '<span class="dot ' + (active ? esc(active.state) : 'waiting') + '"></span>' +
-              '<span class="pill-agent">Auto</span>' +
+              '<span class="pill-agent">Auto' + (active ? ' · ' + esc(active.agent) : '') + '</span>' +
             '</button>'
           ];
           for (var i = 0; i < agents.length; i++) {

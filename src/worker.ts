@@ -59,6 +59,8 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
   let refreshTimer: ReturnType<typeof setTimeout> | null = null
   let debounceTimer: ReturnType<typeof setTimeout> | null = null
   let inFlightRefresh: Promise<TelemetrySnapshot> | null = null
+  let contextEpoch = 0
+  let selectionEpoch = 0
   let disposed = false
 
   const promptTimings = new Map<string, PromptTimingHint>()
@@ -304,7 +306,9 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
     cfg: Awaited<ReturnType<typeof readSettings>>,
     orcaCtx: Awaited<ReturnType<typeof orcaCollector.collect>>,
     homeRoots: Awaited<ReturnType<typeof wslEnv.getHomeSearchRoots>>,
-    git: TelemetrySnapshot['git']
+    git: TelemetrySnapshot['git'],
+    wsEpoch: number,
+    selEpoch: number
   ): Promise<TelemetrySnapshot> => {
     const agents = applyLiveActivityOverlay(orcaCtx.agents)
     const activeAgent = pickActiveAgent(agents)
@@ -372,6 +376,11 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
       diagnostics: logger.getRecent(15)
     }
 
+    // Drop commit only if a newer workspace change or explicit agent selection superseded this run.
+    if ((wsEpoch !== contextEpoch || selEpoch !== selectionEpoch) && latestSnapshot) {
+      return latestSnapshot
+    }
+
     latestSnapshot = snapshot
     await updateStatusBar(snapshot)
     orca.panels.post('telemetry.updated', snapshot)
@@ -387,12 +396,17 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
       return inFlightRefresh
     }
 
+    const wsEpoch = contextEpoch
+    const selEpoch = selectionEpoch
     const work = (async (): Promise<TelemetrySnapshot> => {
       const cfg = await readSettings()
       const orcaCtx = await orcaCollector.collect(orca, wslEnv, {
         forceSessions: options?.force ?? false,
         preferCachedCli: options?.preferCachedCli ?? false
       })
+      if ((wsEpoch !== contextEpoch || selEpoch !== selectionEpoch) && latestSnapshot) {
+        return latestSnapshot
+      }
       const sameWorkspace =
         lastWorkspaceCtx?.workspace.workspaceId === orcaCtx.workspace.workspaceId &&
         lastWorkspaceCtx?.workspace.linuxPath === orcaCtx.workspace.linuxPath &&
@@ -406,12 +420,15 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
           ? Promise.resolve(lastGitSnapshot)
           : gitCollector.collect(orcaCtx.workspace, orcaCtx.branch, wslEnv, options?.force ?? false)
       ])
+      if ((wsEpoch !== contextEpoch || selEpoch !== selectionEpoch) && latestSnapshot) {
+        return latestSnapshot
+      }
 
       lastWorkspaceCtx = orcaCtx
       lastHomeRoots = homeRoots
       lastGitSnapshot = git
 
-      return buildSnapshotForContext(cfg, orcaCtx, homeRoots, git)
+      return buildSnapshotForContext(cfg, orcaCtx, homeRoots, git, wsEpoch, selEpoch)
     })()
 
     inFlightRefresh = work
@@ -463,13 +480,15 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
   const disposables = [
     orca.events.on('workspace.changed', () => {
       pinnedAgentKey = null
+      contextEpoch += 1
       if (disposed) return
       if (debounceTimer) clearTimeout(debounceTimer)
       debounceTimer = setTimeout(() => {
         debounceTimer = null
         if (disposed) return
+        const switchEpoch = contextEpoch
         void refresh({ preferCachedCli: true }).then(() => {
-          if (!disposed) void refresh({ force: true })
+          if (!disposed && switchEpoch === contextEpoch) void refresh({ force: true })
         })
       }, 35)
     }),
@@ -545,10 +564,23 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
       return refresh({ force: input?.forceRefresh ?? false })
     }),
     orca.panels.handle('telemetry.selectAgent', async ({ agentKey }) => {
+      if (debounceTimer) {
+        clearTimeout(debounceTimer)
+        debounceTimer = null
+      }
       pinnedAgentKey = agentKey === '__auto__' ? null : agentKey
+      const selEpoch = ++selectionEpoch
+      const wsEpoch = contextEpoch
       if (lastWorkspaceCtx && lastGitSnapshot) {
         const cfg = await readSettings()
-        return buildSnapshotForContext(cfg, lastWorkspaceCtx, lastHomeRoots, lastGitSnapshot)
+        return buildSnapshotForContext(
+          cfg,
+          lastWorkspaceCtx,
+          lastHomeRoots,
+          lastGitSnapshot,
+          wsEpoch,
+          selEpoch
+        )
       }
       return refresh({ force: false })
     }),
@@ -563,6 +595,10 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
       return { ok: true }
     }),
     orca.panels.handle('telemetry.toggleCursorHook', async ({ enabled }) => {
+      if (debounceTimer) {
+        clearTimeout(debounceTimer)
+        debounceTimer = null
+      }
       await orca.settings.set('cursorHookEnabled', enabled)
       const currentWs = latestSnapshot?.workspace ?? (await orcaCollector.collect(orca, wslEnv)).workspace
       const status = await cursorHook.applyToggle(enabled, currentWs, wslEnv, lastCursorHookEventAt)
@@ -573,6 +609,10 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
       return refresh({ force: true })
     }),
     orca.panels.handle('telemetry.updateSettings', async (input) => {
+      if (debounceTimer) {
+        clearTimeout(debounceTimer)
+        debounceTimer = null
+      }
       if (typeof input.showStatusBar === 'boolean') {
         await orca.settings.set('showStatusBar', input.showStatusBar)
       }

@@ -60,8 +60,14 @@ function makeAdapterCtx(homeDir: string, agent: Partial<AgentOption>, workspace?
 }
 
 test('parses and resolves WSL UNC and experimental WSL host paths', async () => {
-  const cleanEnv = buildCleanChildEnv({ ELECTRON_RUN_AS_NODE: '1' })
+  const cleanEnv = buildCleanChildEnv({
+    ELECTRON_RUN_AS_NODE: '1',
+    ORCA_CLI_COMMAND: 'environment',
+    ORCA_WINDOWS_PACKAGED_CLI_LAUNCHER: '1'
+  })
   assert.equal('ELECTRON_RUN_AS_NODE' in cleanEnv, false)
+  assert.equal('ORCA_CLI_COMMAND' in cleanEnv, false)
+  assert.equal('ORCA_WINDOWS_PACKAGED_CLI_LAUNCHER' in cleanEnv, false)
   assert.equal(cleanEnv.WSL_UTF8, '1')
 
   assert.deepEqual(parseWslUncPath('\\\\wsl.localhost\\Ubuntu-24.04\\home\\alice\\repo'), {
@@ -92,6 +98,28 @@ test('parses and resolves WSL UNC and experimental WSL host paths', async () => 
   assert.equal(resolved.hostKind, 'wsl')
   assert.equal(resolved.wslDistro, 'Ubuntu-24.04')
   assert.equal(resolved.windowsPath, '\\\\wsl.localhost\\Ubuntu-24.04\\home\\alice\\repo')
+})
+
+test('resolves Orca CLI executable from execPath or homedir even when LOCALAPPDATA is unset', async () => {
+  if (process.platform !== 'win32') return
+
+  const siblingBin = 'C:\\Custom\\Orca\\resources\\bin\\orca.exe'
+  const byExecPath = new WslEnvironmentResolver({
+    execPath: 'C:\\Custom\\Orca\\Orca.exe',
+    localAppData: null,
+    homeDir: 'C:\\Users\\alice',
+    pathExists: async (p) => path.normalize(p) === path.normalize(siblingBin)
+  })
+  assert.equal(await byExecPath.resolveOrcaExecutable(), path.normalize(siblingBin))
+
+  const homeBin = 'C:\\Users\\alice\\AppData\\Local\\Programs\\orca\\resources\\bin\\orca.exe'
+  const byHomeDir = new WslEnvironmentResolver({
+    execPath: 'C:\\Windows\\node.exe',
+    localAppData: null,
+    homeDir: 'C:\\Users\\alice',
+    pathExists: async (p) => path.normalize(p) === path.normalize(homeBin)
+  })
+  assert.equal(await byHomeDir.resolveOrcaExecutable(), path.normalize(homeBin))
 })
 
 test('parses git porcelain v2, numstat, and last commit', () => {

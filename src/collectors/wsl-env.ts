@@ -29,9 +29,12 @@ export function buildCleanChildEnv(
     WSL_UTF8: '1',
     ...extra
   }
-  // Electron `trusted-worker` processes inherit ELECTRON_RUN_AS_NODE=1; strip it so `orca.exe` runs as CLI.
+  // Electron `trusted-worker` processes inherit ELECTRON_RUN_AS_NODE=1 and CLI wrapper vars;
+  // strip them so `resources/bin/orca.exe` executes cleanly as a standalone CLI.
   delete childEnv.ELECTRON_RUN_AS_NODE
   delete childEnv.ELECTRON_NO_ATTACH_CONSOLE
+  delete childEnv.ORCA_CLI_COMMAND
+  delete childEnv.ORCA_WINDOWS_PACKAGED_CLI_LAUNCHER
   return childEnv
 }
 
@@ -95,6 +98,9 @@ export class WslEnvironmentResolver {
   private readonly runner: CommandRunner
   private readonly pathExists: (p: string) => Promise<boolean>
   private readonly logger?: TelemetryLogger
+  private readonly execPathOverride?: string | null
+  private readonly localAppDataOverride?: string | null
+  private readonly homeDirOverride?: string
   private runningDistrosCache: { at: number; distros: string[] } | null = null
   private readonly wslHomeCache = new Map<string, string>()
   private orcaBinCache: string | null | undefined = undefined
@@ -103,9 +109,15 @@ export class WslEnvironmentResolver {
     runner?: CommandRunner
     pathExists?: (p: string) => Promise<boolean>
     logger?: TelemetryLogger
+    execPath?: string | null
+    localAppData?: string | null
+    homeDir?: string
   }) {
     this.runner = deps?.runner ?? defaultCommandRunner
     this.logger = deps?.logger
+    this.execPathOverride = deps?.execPath
+    this.localAppDataOverride = deps?.localAppData
+    this.homeDirOverride = deps?.homeDir
     this.pathExists =
       deps?.pathExists ??
       (async (p: string) => {
@@ -123,14 +135,49 @@ export class WslEnvironmentResolver {
       return this.orcaBinCache
     }
     if (process.platform === 'win32') {
-      const localAppData = process.env.LOCALAPPDATA
+      const execPath =
+        this.execPathOverride === undefined ? process.execPath : this.execPathOverride
+      const localAppData =
+        this.localAppDataOverride === undefined
+          ? process.env.LOCALAPPDATA
+          : this.localAppDataOverride
+      const homeDir = this.homeDirOverride ?? os.homedir()
+      const candidates: string[] = []
+      const addCandidate = (p: string | null | undefined): void => {
+        if (!p) return
+        const normalized = path.normalize(p)
+        if (!candidates.includes(normalized)) candidates.push(normalized)
+      }
+
+      if (execPath) {
+        addCandidate(path.join(path.dirname(execPath), 'resources', 'bin', 'orca.exe'))
+      }
       if (localAppData) {
-        const candidate = path.join(localAppData, 'Programs', 'orca', 'resources', 'bin', 'orca.exe')
+        addCandidate(path.join(localAppData, 'Programs', 'orca', 'resources', 'bin', 'orca.exe'))
+      }
+      if (homeDir) {
+        addCandidate(
+          path.join(homeDir, 'AppData', 'Local', 'Programs', 'orca', 'resources', 'bin', 'orca.exe')
+        )
+      }
+
+      for (const candidate of candidates) {
         if (await this.pathExists(candidate)) {
           this.orcaBinCache = candidate
+          this.logger?.logOnce('orca-bin', 'INFO', 'orca-cli', 'Resolved Orca CLI binary', {
+            bin: candidate
+          })
           return candidate
         }
       }
+
+      this.logger?.logOnce(
+        'orca-bin-fallback',
+        'WARN',
+        'orca-cli',
+        'Falling back to bare "orca" command because packaged resources/bin/orca.exe was not found',
+        { candidates }
+      )
     }
     this.orcaBinCache = 'orca'
     return 'orca'

@@ -1,6 +1,7 @@
 // Minimal Node built-in declarations so `tsc` checks without requiring `npm install @types/node`.
 declare const process: {
   readonly platform: string
+  readonly execPath?: string
   readonly env: Record<string, string | undefined>
 }
 

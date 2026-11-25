@@ -1,3 +1,4 @@
+import type { TelemetryLogger } from '../logger'
 import type { AgentOption, TelemetrySource, TokenStats, ToolCount, WorkspaceEnv } from '../protocol'
 import type { OrcaSessionSummary } from '../collectors/orca-context'
 import type { HomeRoot } from '../collectors/wsl-env'
@@ -37,4 +38,5 @@ export type AdapterContext = {
   orcaSession: OrcaSessionSummary | null
   cursorHookEnabled: boolean
   modelOverrides: Record<string, number>
+  logger?: TelemetryLogger
 }

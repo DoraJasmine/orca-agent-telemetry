@@ -1,3 +1,4 @@
+import type { TelemetryLogger } from '../logger'
 import type { GitFileChange, GitSnapshot, WorkspaceEnv } from '../protocol'
 import type { WslEnvironmentResolver } from './wsl-env'
 
@@ -134,7 +135,12 @@ export function parseGitOutputs(input: {
 }
 
 export class GitCollector {
+  private readonly logger?: TelemetryLogger
   private cache: { key: string; at: number; snapshot: GitSnapshot } | null = null
+
+  constructor(options?: { logger?: TelemetryLogger }) {
+    this.logger = options?.logger
+  }
 
   async collect(
     workspace: WorkspaceEnv,
@@ -183,10 +189,14 @@ export class GitCollector {
 
     const statusRes = await runGit(['status', '--porcelain=v2', '--branch'])
     if (!statusRes || statusRes.exitCode !== 0) {
+      const errText = statusRes?.stderr?.trim()
+      if (errText) {
+        this.logger?.logOnce(`git-err:${workspace.displayName}`, 'WARN', 'git', `git status failed (${source}): ${errText}`)
+      }
       return emptyGitSnapshot(
         fallbackBranch ? 'orca-branch' : 'unavailable',
         fallbackBranch,
-        statusRes?.stderr?.trim() || undefined
+        errText || undefined
       )
     }
 

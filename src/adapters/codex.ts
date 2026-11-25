@@ -1,6 +1,15 @@
 import * as path from 'node:path'
 import type { ToolCount } from '../protocol'
-import { findMatchingFiles, normalizePathForCompare, readHeadUtf8 } from './fs-lookup'
+import {
+  agentActivityTimestamp,
+  buildPromptSnippet,
+  buildWorkspacePathSet,
+  findMatchingFiles,
+  normalizePathForCompare,
+  pickClosestFileByTimestamp,
+  readHeadUtf8,
+  type FoundFile
+} from './fs-lookup'
 import { resolveContextWindow } from './model-windows'
 import { JsonlTailer, parseIsoTimestampMs, safeJsonParse } from './tailer'
 import type { AdapterContext, AdapterResult, ParsedTurn } from './types'
@@ -8,6 +17,7 @@ import type { AdapterContext, AdapterResult, ParsedTurn } from './types'
 type CodexTotals = {
   input: number
   cached: number
+  cacheWrite: number
   output: number
   reasoning: number
   total: number
@@ -62,6 +72,8 @@ export function ingestCodexLine(line: string, state: CodexParseState, observedAt
     if (itemType === 'function_call' || itemType === 'custom_tool_call') {
       const name = readString(payload.name) ?? 'tool'
       recordTool(state.tools, name, ts)
+    } else if (itemType === 'message' && readString(payload.role) === 'user') {
+      state.lastTurnAnchorMs = ts
     }
     return
   }
@@ -91,6 +103,7 @@ export function ingestCodexLine(line: string, state: CodexParseState, observedAt
     ? {
         input: readNumber(totalObj.input_tokens),
         cached: readNumber(totalObj.cached_input_tokens),
+        cacheWrite: readNumber(totalObj.cache_write_input_tokens),
         output: readNumber(totalObj.output_tokens),
         reasoning: readNumber(totalObj.reasoning_output_tokens),
         total: readNumber(totalObj.total_tokens)
@@ -99,25 +112,28 @@ export function ingestCodexLine(line: string, state: CodexParseState, observedAt
 
   // Codex re-emits identical `token_count` payloads when refreshing rate limits.
   if (currentTotal) {
-    const key = `${currentTotal.input}:${currentTotal.cached}:${currentTotal.output}:${currentTotal.reasoning}:${currentTotal.total}`
+    const key = `${currentTotal.input}:${currentTotal.cached}:${currentTotal.cacheWrite}:${currentTotal.output}:${currentTotal.reasoning}:${currentTotal.total}`
     if (key === state.lastUsageKey) return
     state.lastUsageKey = key
   }
 
   let turnInput = 0
   let turnCached = 0
+  let turnCacheWrite = 0
   let turnOutput = 0
   let turnReasoning = 0
 
   if (lastObj && (readNumber(lastObj.input_tokens) > 0 || readNumber(lastObj.output_tokens) > 0)) {
     turnInput = readNumber(lastObj.input_tokens)
     turnCached = readNumber(lastObj.cached_input_tokens)
+    turnCacheWrite = readNumber(lastObj.cache_write_input_tokens)
     turnOutput = readNumber(lastObj.output_tokens)
     turnReasoning = readNumber(lastObj.reasoning_output_tokens)
   } else if (currentTotal) {
-    const prev = state.lastTotal ?? { input: 0, cached: 0, output: 0, reasoning: 0, total: 0 }
+    const prev = state.lastTotal ?? { input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, total: 0 }
     turnInput = Math.max(0, currentTotal.input - prev.input)
     turnCached = Math.max(0, currentTotal.cached - prev.cached)
+    turnCacheWrite = Math.max(0, currentTotal.cacheWrite - prev.cacheWrite)
     turnOutput = Math.max(0, currentTotal.output - prev.output)
     turnReasoning = Math.max(0, currentTotal.reasoning - prev.reasoning)
   }
@@ -127,7 +143,7 @@ export function ingestCodexLine(line: string, state: CodexParseState, observedAt
   }
 
   // In OpenAI/Codex usage objects, `cached_input_tokens` is a subset of `input_tokens`.
-  const inputUncached = Math.max(0, turnInput - turnCached)
+  const inputUncached = Math.max(0, turnInput - turnCached - turnCacheWrite)
   const contextUsed = turnInput + turnOutput > 0 ? turnInput + turnOutput : null
 
   if (contextUsed !== null && state.lastContextUsed !== null) {
@@ -153,7 +169,7 @@ export function ingestCodexLine(line: string, state: CodexParseState, observedAt
     output: turnOutput,
     reasoning: turnReasoning,
     cacheRead: turnCached,
-    cacheWrite: 0,
+    cacheWrite: turnCacheWrite,
     contextUsed,
     contextLimit: state.contextWindow
   })
@@ -161,15 +177,25 @@ export function ingestCodexLine(line: string, state: CodexParseState, observedAt
 
 export class CodexAdapter {
   private readonly tailer = new JsonlTailer<CodexParseState>()
-  private readonly pathBySession = new Map<string, string>()
+  private readonly pathByAgentKey = new Map<string, string>()
 
   async collect(ctx: AdapterContext): Promise<AdapterResult | null> {
     const logPath = await this.locateSessionFile(ctx)
-    if (!logPath) return null
+    if (!logPath) {
+      ctx.logger?.logOnce(
+        `codex-miss:${ctx.agent.key}`,
+        'INFO',
+        'codex',
+        `No rollout JSONL matched for key=${ctx.agent.key} sessionId=${ctx.agent.sessionId ?? 'none'}`
+      )
+      return null
+    }
+
+    ctx.logger?.logOnce(`codex-hit:${ctx.agent.key}`, 'INFO', 'codex', `Using rollout log: ${logPath}`)
 
     const res = await this.tailer.readIncremental(logPath, createCodexState, ingestCodexLine)
     if (!res.exists) {
-      if (ctx.agent.sessionId) this.pathBySession.delete(ctx.agent.sessionId)
+      this.pathByAgentKey.delete(ctx.agent.key)
       return null
     }
 
@@ -194,12 +220,12 @@ export class CodexAdapter {
       turns: state.turns,
       cumulativeOverride: state.lastTotal
         ? {
-            inputUncached: Math.max(0, state.lastTotal.input - state.lastTotal.cached),
+            inputUncached: Math.max(0, state.lastTotal.input - state.lastTotal.cached - state.lastTotal.cacheWrite),
             inputTotal: state.lastTotal.input,
             output: state.lastTotal.output,
             reasoning: state.lastTotal.reasoning,
             cacheRead: state.lastTotal.cached,
-            cacheWrite: 0,
+            cacheWrite: state.lastTotal.cacheWrite,
             total: state.lastTotal.total
           }
         : null,
@@ -208,17 +234,14 @@ export class CodexAdapter {
   }
 
   private async locateSessionFile(ctx: AdapterContext): Promise<string | null> {
-    const sid = ctx.agent.sessionId
-    if (sid) {
-      const cached = this.pathBySession.get(sid)
-      if (cached) return cached
-    }
+    const cacheKey = ctx.agent.key
+    const cached = this.pathByAgentKey.get(cacheKey)
+    if (cached) return cached
 
-    const targetWorkspacePaths = new Set(
-      [ctx.workspace.linuxPath, ctx.workspace.windowsPath, ctx.workspace.rawPath]
-        .map(normalizePathForCompare)
-        .filter(Boolean)
-    )
+    const sid = ctx.agent.sessionId
+    const targetPaths = buildWorkspacePathSet(ctx.workspace)
+    const promptHint = buildPromptSnippet(ctx.agent.prompt)
+    const targetMs = agentActivityTimestamp(ctx.agent)
 
     for (const root of ctx.homeRoots) {
       const sessionsRoot = path.join(root.homeWin, '.codex', 'sessions')
@@ -232,28 +255,36 @@ export class CodexAdapter {
       if (sid) {
         const direct = files.find((f) => f.path.includes(sid))
         if (direct) {
-          this.pathBySession.set(sid, direct.path)
+          this.pathByAgentKey.set(cacheKey, direct.path)
           return direct.path
-        }
-        for (const candidate of files.slice(0, 20)) {
-          const head = await readHeadUtf8(candidate.path, 2048)
-          if (head.includes(sid)) {
-            this.pathBySession.set(sid, candidate.path)
-            return candidate.path
-          }
         }
       }
 
-      if (targetWorkspacePaths.size > 0) {
-        for (const candidate of files.slice(0, 12)) {
-          const head = await readHeadUtf8(candidate.path, 2048)
-          const firstLine = head.split(/\r?\n/)[0] ?? ''
-          const meta = safeJsonParse<{ payload?: { cwd?: string } }>(firstLine)
-          const cwd = normalizePathForCompare(meta?.payload?.cwd)
-          if (cwd && targetWorkspacePaths.has(cwd)) {
-            if (sid) this.pathBySession.set(sid, candidate.path)
+      // In Orca Native Chat, `orcaSessionId` differs from Codex's internal session UUID; match by cwd + prompt/mtime.
+      const cwdMatches: FoundFile[] = []
+      for (const candidate of files.slice(0, 25)) {
+        const head = await readHeadUtf8(candidate.path, 8192)
+        if (sid && head.includes(sid)) {
+          this.pathByAgentKey.set(cacheKey, candidate.path)
+          return candidate.path
+        }
+        const firstLine = head.split(/\r?\n/)[0] ?? ''
+        const meta = safeJsonParse<{ payload?: { cwd?: string } }>(firstLine)
+        const cwd = normalizePathForCompare(meta?.payload?.cwd)
+        if (cwd && targetPaths.has(cwd)) {
+          if (promptHint && head.includes(promptHint)) {
+            this.pathByAgentKey.set(cacheKey, candidate.path)
             return candidate.path
           }
+          cwdMatches.push(candidate)
+        }
+      }
+
+      if (cwdMatches.length > 0) {
+        const best = pickClosestFileByTimestamp(cwdMatches, targetMs)
+        if (best) {
+          this.pathByAgentKey.set(cacheKey, best.path)
+          return best.path
         }
       }
     }

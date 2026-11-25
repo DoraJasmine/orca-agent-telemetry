@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import type { TelemetryLogger } from '../logger'
 import type { WorkspaceEnv } from '../protocol'
 
 export type CommandRunner = (
@@ -9,6 +10,16 @@ export type CommandRunner = (
   args: readonly string[],
   options?: { cwd?: string; timeoutMs?: number; env?: Record<string, string | undefined> }
 ) => Promise<{ stdout: string; stderr: string; exitCode: number }>
+
+function decodeProcessBuffer(raw: string | Buffer): string {
+  if (typeof raw === 'string') return raw.replace(/\0/g, '').replace(/^\uFEFF/, '')
+  if (raw.length === 0) return ''
+  // Windows `wsl.exe` emits UTF-16LE with interleaved null bytes unless WSL_UTF8=1 is honored.
+  if (raw.includes(0)) {
+    return raw.toString('utf16le').replace(/\0/g, '').replace(/^\uFEFF/, '')
+  }
+  return raw.toString('utf8').replace(/^\uFEFF/, '')
+}
 
 export const defaultCommandRunner: CommandRunner = (file, args, options) =>
   new Promise((resolve) => {
@@ -20,7 +31,7 @@ export const defaultCommandRunner: CommandRunner = (file, args, options) =>
         timeout: options?.timeoutMs ?? 4500,
         maxBuffer: 4 * 1024 * 1024,
         windowsHide: true,
-        encoding: 'utf8',
+        encoding: 'buffer',
         env: {
           ...process.env,
           WSL_UTF8: '1',
@@ -28,8 +39,8 @@ export const defaultCommandRunner: CommandRunner = (file, args, options) =>
         }
       },
       (error, stdout, stderr) => {
-        const cleanStdout = typeof stdout === 'string' ? stdout.replace(/\0/g, '') : ''
-        const cleanStderr = typeof stderr === 'string' ? stderr.replace(/\0/g, '') : ''
+        const cleanStdout = decodeProcessBuffer(stdout)
+        const cleanStderr = decodeProcessBuffer(stderr)
         if (!error) {
           resolve({ stdout: cleanStdout, stderr: cleanStderr, exitCode: 0 })
           return
@@ -73,11 +84,18 @@ export type HomeRoot = {
 export class WslEnvironmentResolver {
   private readonly runner: CommandRunner
   private readonly pathExists: (p: string) => Promise<boolean>
+  private readonly logger?: TelemetryLogger
   private runningDistrosCache: { at: number; distros: string[] } | null = null
   private readonly wslHomeCache = new Map<string, string>()
+  private orcaBinCache: string | null | undefined = undefined
 
-  constructor(deps?: { runner?: CommandRunner; pathExists?: (p: string) => Promise<boolean> }) {
+  constructor(deps?: {
+    runner?: CommandRunner
+    pathExists?: (p: string) => Promise<boolean>
+    logger?: TelemetryLogger
+  }) {
     this.runner = deps?.runner ?? defaultCommandRunner
+    this.logger = deps?.logger
     this.pathExists =
       deps?.pathExists ??
       (async (p: string) => {
@@ -90,6 +108,32 @@ export class WslEnvironmentResolver {
       })
   }
 
+  async resolveOrcaExecutable(): Promise<string> {
+    if (this.orcaBinCache !== undefined && this.orcaBinCache !== null) {
+      return this.orcaBinCache
+    }
+    if (process.platform === 'win32') {
+      const localAppData = process.env.LOCALAPPDATA
+      if (localAppData) {
+        const candidate = path.join(localAppData, 'Programs', 'orca', 'resources', 'bin', 'orca.exe')
+        if (await this.pathExists(candidate)) {
+          this.orcaBinCache = candidate
+          return candidate
+        }
+      }
+    }
+    this.orcaBinCache = 'orca'
+    return 'orca'
+  }
+
+  async execOrcaCli(
+    args: readonly string[],
+    options?: { timeoutMs?: number }
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    const bin = await this.resolveOrcaExecutable()
+    return this.runner(bin, args, { timeoutMs: options?.timeoutMs ?? 4500 })
+  }
+
   /** List only already-running WSL distros so sleeping VMs are never woken accidentally. */
   async listRunningDistros(force = false): Promise<string[]> {
     if (process.platform !== 'win32') return []
@@ -99,6 +143,9 @@ export class WslEnvironmentResolver {
     }
     const res = await this.runner('wsl.exe', ['-l', '--running', '-q'], { timeoutMs: 3000 })
     if (res.exitCode !== 0) {
+      if (res.stderr.trim()) {
+        this.logger?.logOnce('wsl-list', 'WARN', 'wsl', `wsl.exe -l --running failed: ${res.stderr.trim()}`)
+      }
       this.runningDistrosCache = { at: now, distros: [] }
       return []
     }
@@ -107,6 +154,9 @@ export class WslEnvironmentResolver {
       .map((line) => line.trim())
       .filter((line) => line.length > 0)
     this.runningDistrosCache = { at: now, distros }
+    if (distros.length > 0) {
+      this.logger?.logOnce('wsl-running', 'INFO', 'wsl', `Running WSL distros: ${distros.join(', ')}`)
+    }
     return distros
   }
 
@@ -117,7 +167,15 @@ export class WslEnvironmentResolver {
       timeoutMs: 3500
     })
     const home = res.exitCode === 0 ? res.stdout.trim() : ''
-    if (!home.startsWith('/')) return null
+    if (!home.startsWith('/')) {
+      this.logger?.logOnce(
+        `wsl-home:${distro}`,
+        'WARN',
+        'wsl',
+        `Failed to resolve $HOME for distro "${distro}": ${res.stderr.trim() || 'empty output'}`
+      )
+      return null
+    }
     this.wslHomeCache.set(distro, home)
     return home
   }

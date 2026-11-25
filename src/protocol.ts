@@ -99,9 +99,11 @@ export type AgentOption = {
   title: string | null
   state: AgentState
   stateStartedAt: number
+  updatedAt: number | null
   sessionId: string | null
   terminalId: string | null
   taskTitle: string | null
+  prompt: string | null
 }
 
 export type ToolCount = {
@@ -132,6 +134,7 @@ export type TelemetrySnapshot = {
   git: GitSnapshot
   cursorHook: CursorHookStatus
   settings: PluginDisplaySettings
+  diagnostics: string[]
 }
 
 declare module 'orca' {

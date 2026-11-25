@@ -10,6 +10,16 @@ export type ModelSpec = {
 const DEFAULT_MODEL_TABLE: readonly [RegExp, ModelSpec][] = [
   // OpenAI / Codex models
   [
+    /gpt-6/i,
+    {
+      contextWindow: 475_000,
+      inputPerMillion: 1.5,
+      outputPerMillion: 10.0,
+      cacheReadPerMillion: 0.15,
+      cacheWritePerMillion: 1.5
+    }
+  ],
+  [
     /gpt-5.*codex|codex/i,
     {
       contextWindow: 258_400,
@@ -51,7 +61,7 @@ const DEFAULT_MODEL_TABLE: readonly [RegExp, ModelSpec][] = [
   ],
   // Kimi models
   [
-    /kimi-k2\.5|kimi-k3|kimi-for-coding|kimi-k2/i,
+    /kimi-k2\.5|kimi-k3|kimi-for-coding|kimi-k2|k3\.\d/i,
     {
       contextWindow: 256_000,
       inputPerMillion: 0.6,
@@ -72,7 +82,7 @@ const DEFAULT_MODEL_TABLE: readonly [RegExp, ModelSpec][] = [
   ],
   // Claude models (via agy / cursor)
   [
-    /claude.*opus.*4/i,
+    /claude.*opus/i,
     {
       contextWindow: 200_000,
       inputPerMillion: 15.0,
@@ -82,7 +92,7 @@ const DEFAULT_MODEL_TABLE: readonly [RegExp, ModelSpec][] = [
     }
   ],
   [
-    /claude.*(sonnet|haiku)/i,
+    /claude/i,
     {
       contextWindow: 200_000,
       inputPerMillion: 3.0,

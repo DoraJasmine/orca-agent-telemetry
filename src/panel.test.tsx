@@ -21,9 +21,11 @@ function makeSnapshot(overrides?: Partial<TelemetrySnapshot>): TelemetrySnapshot
         title: 'codex',
         state: 'working',
         stateStartedAt: 1_700_000_000_000,
+        updatedAt: 1_700_000_000_000,
         sessionId: 's-1',
         terminalId: 't-1',
-        taskTitle: 'Fix telemetry'
+        taskTitle: 'Fix telemetry',
+        prompt: 'Fix telemetry'
       },
       {
         key: 't-2',
@@ -31,9 +33,11 @@ function makeSnapshot(overrides?: Partial<TelemetrySnapshot>): TelemetrySnapshot
         title: 'cursor',
         state: 'waiting',
         stateStartedAt: 1_699_999_950_000,
+        updatedAt: 1_699_999_950_000,
         sessionId: 's-2',
         terminalId: 't-2',
-        taskTitle: null
+        taskTitle: null,
+        prompt: null
       }
     ],
     selectedAgentKey: 't-1',
@@ -43,9 +47,11 @@ function makeSnapshot(overrides?: Partial<TelemetrySnapshot>): TelemetrySnapshot
       title: 'codex',
       state: 'working',
       stateStartedAt: 1_700_000_000_000,
+      updatedAt: 1_700_000_000_000,
       sessionId: 's-1',
       terminalId: 't-1',
-      taskTitle: 'Fix telemetry'
+      taskTitle: 'Fix telemetry',
+      prompt: 'Fix telemetry'
     },
     source: 'codex-jsonl',
     sourceLabel: 'Codex JSONL',
@@ -111,7 +117,8 @@ function makeSnapshot(overrides?: Partial<TelemetrySnapshot>): TelemetrySnapshot
       showStatusBar: true,
       showEstimatedCost: true,
       cursorHookEnabled: false
-    }
+    },
+    diagnostics: ['[INFO] [worker] Activated']
   }
   return { ...base, ...overrides }
 }

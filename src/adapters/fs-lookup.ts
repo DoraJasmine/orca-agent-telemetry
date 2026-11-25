@@ -1,5 +1,6 @@
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
+import type { AgentOption, WorkspaceEnv } from '../protocol'
 
 export type FoundFile = {
   path: string
@@ -22,6 +23,30 @@ export async function readHeadUtf8(filePath: string, maxBytes = 4096): Promise<s
       const buf = Buffer.alloc(maxBytes)
       const { bytesRead } = await handle.read(buf, 0, maxBytes, 0)
       return buf.subarray(0, bytesRead).toString('utf8')
+    } finally {
+      await handle.close()
+    }
+  } catch {
+    return ''
+  }
+}
+
+export async function readTailUtf8(filePath: string, maxBytes = 128 * 1024): Promise<string> {
+  try {
+    const st = await fs.stat(filePath)
+    if (st.size === 0) return ''
+    const start = Math.max(0, st.size - maxBytes)
+    const length = st.size - start
+    const handle = await fs.open(filePath, 'r')
+    try {
+      const buf = Buffer.alloc(length)
+      const { bytesRead } = await handle.read(buf, 0, length, start)
+      const text = buf.subarray(0, bytesRead).toString('utf8')
+      if (start > 0) {
+        const firstNewline = text.indexOf('\n')
+        return firstNewline >= 0 ? text.slice(firstNewline + 1) : text
+      }
+      return text
     } finally {
       await handle.close()
     }
@@ -89,4 +114,43 @@ export async function findMatchingFiles(
 export function normalizePathForCompare(p: string | null | undefined): string {
   if (!p) return ''
   return p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+}
+
+export function buildWorkspacePathSet(workspace: WorkspaceEnv): Set<string> {
+  return new Set(
+    [workspace.linuxPath, workspace.windowsPath, workspace.rawPath]
+      .map(normalizePathForCompare)
+      .filter(Boolean)
+  )
+}
+
+export function buildPromptSnippet(prompt: string | null | undefined): string | null {
+  if (!prompt) return null
+  const firstLine = prompt.trim().split(/\r?\n/)[0]?.trim() ?? ''
+  if (firstLine.length < 3) return null
+  return firstLine.slice(0, 60)
+}
+
+export function agentActivityTimestamp(agent: AgentOption): number {
+  return Math.max(agent.updatedAt ?? 0, agent.stateStartedAt || 0)
+}
+
+export function pickClosestFileByTimestamp(
+  files: readonly FoundFile[],
+  targetMs: number,
+  maxDeltaMs = 24 * 60 * 60_000
+): FoundFile | null {
+  if (files.length === 0) return null
+  if (targetMs <= 0) return files[0]
+
+  let best: FoundFile | null = null
+  let bestDelta = Infinity
+  for (const f of files) {
+    const delta = Math.abs(f.mtimeMs - targetMs)
+    if (delta <= maxDeltaMs && delta < bestDelta) {
+      bestDelta = delta
+      best = f
+    }
+  }
+  return best ?? files[0]
 }

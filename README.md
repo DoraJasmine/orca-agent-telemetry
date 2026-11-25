@@ -32,6 +32,8 @@ orca plugin install https://github.com/DoraJasmine/orca-agent-telemetry.git
 
 安装时按提示批准插件权限（`workspace:read`、`agent:read`、`history:read`、`storage:own`、`settings:own` 及 `trusted-worker`），随后在 Orca 右侧边栏点击 **Agent Telemetry** 图标即可查看。
 
+> **兼容性说明**：支持 Orca Paired Environment（`--environment WSL`）以及 Orca Native Chat 会话（当 `orcaSessionId` 与底层 CLI 的 UUID 不同时，自动通过工作区路径、`state.json`、`history.jsonl` 与首条提示词/时间接近度匹配）。面板底部的 **Diagnostics & Logs** 可展开查看工作区路径、命中的日志文件及运行日志（持久化于 `~/.orca-telemetry/plugin.log`）。
+
 ### 本地开发与测试
 
 ```powershell

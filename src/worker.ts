@@ -11,6 +11,7 @@ import { OrcaContextCollector, type OrcaSessionSummary } from './collectors/orca
 import { WslEnvironmentResolver } from './collectors/wsl-env'
 import { computeMetrics, type PromptTimingHint } from './engine/metrics'
 import { CursorHookManager } from './helpers/cursor-hook'
+import { TelemetryLogger } from './logger'
 import type {
   AgentOption,
   PluginDisplaySettings,
@@ -32,9 +33,12 @@ export function deactivate(): void {
 export default async function activate(orca: OrcaWorkerApi): Promise<void> {
   deactivate()
 
-  const wslEnv = new WslEnvironmentResolver()
-  const orcaCollector = new OrcaContextCollector()
-  const gitCollector = new GitCollector()
+  const logger = new TelemetryLogger({
+    sink: (msg) => orca.log(msg)
+  })
+  const wslEnv = new WslEnvironmentResolver({ logger })
+  const orcaCollector = new OrcaContextCollector({ logger })
+  const gitCollector = new GitCollector({ logger })
   const cursorHook = new CursorHookManager()
 
   const codexAdapter = new CodexAdapter()
@@ -52,6 +56,8 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
   let disposed = false
 
   const promptTimings = new Map<string, PromptTimingHint>()
+
+  logger.info('worker', `Activated (Host API ${orca.api.major}.${orca.api.minor})`)
 
   const readSettings = async (): Promise<{
     display: PluginDisplaySettings
@@ -95,10 +101,15 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
       const exact = agents.find((a) => a.key === selectedAgentKey)
       if (exact) return exact
     }
+    // `agents` are already sorted newest-first (`updatedAt` / `stateStartedAt`); prefer working if recent, else newest.
+    const newest = agents[0]
+    const newestAt = Math.max(newest.updatedAt ?? 0, newest.stateStartedAt)
     const working = agents.find((a) => a.state === 'working')
-    if (working) return working
-    const sorted = [...agents].sort((a, b) => b.stateStartedAt - a.stateStartedAt)
-    return sorted[0] ?? agents[0]
+    if (working) {
+      const workingAt = Math.max(working.updatedAt ?? 0, working.stateStartedAt)
+      if (newestAt - workingAt <= 120_000) return working
+    }
+    return newest
   }
 
   const matchOrcaSession = (
@@ -111,18 +122,25 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
       if (byId) return byId
     }
     const lowerAgent = agent.agent.toLowerCase()
-    return (
-      sessions.find(
-        (s) => s.running && s.agent.toLowerCase() === lowerAgent
-      ) ??
-      sessions.find((s) => s.agent.toLowerCase() === lowerAgent) ??
-      null
-    )
+    const sameAgent = sessions.filter((s) => s.agent.toLowerCase() === lowerAgent)
+    if (sameAgent.length === 0) return null
+    if (agent.title) {
+      const byTitle = sameAgent.find((s) => s.title && agent.title && s.title === agent.title)
+      if (byTitle) return byTitle
+    }
+    const targetMs = Math.max(agent.updatedAt ?? 0, agent.stateStartedAt)
+    if (targetMs > 0) {
+      const sorted = [...sameAgent].sort(
+        (a, b) => Math.abs(a.updatedAt - targetMs) - Math.abs(b.updatedAt - targetMs)
+      )
+      return sorted[0] ?? null
+    }
+    return sameAgent.find((s) => s.running) ?? sameAgent[0] ?? null
   }
 
   const runAdapter = async (
     agent: AgentOption | null,
-    ctxBase: Omit<AdapterContext, 'agent' | 'orcaSession'>,
+    ctxBase: Omit<AdapterContext, 'agent' | 'orcaSession' | 'logger'>,
     sessions: OrcaSessionSummary[]
   ): Promise<AdapterResult> => {
     if (!agent) {
@@ -144,7 +162,8 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
     const adapterCtx: AdapterContext = {
       ...ctxBase,
       agent,
-      orcaSession
+      orcaSession,
+      logger
     }
 
     const kind = agent.agent.toLowerCase()
@@ -298,7 +317,8 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
         recentTools: adapter.recentTools,
         git,
         cursorHook: hookStatus,
-        settings: cfg.display
+        settings: cfg.display,
+        diagnostics: logger.getRecent(15)
       }
 
       latestSnapshot = snapshot
@@ -421,7 +441,11 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
     orca.panels.handle('telemetry.toggleCursorHook', async ({ enabled }) => {
       await orca.settings.set('cursorHookEnabled', enabled)
       const currentWs = latestSnapshot?.workspace ?? (await orcaCollector.collect(orca, wslEnv)).workspace
-      await cursorHook.applyToggle(enabled, currentWs, wslEnv, lastCursorHookEventAt)
+      const status = await cursorHook.applyToggle(enabled, currentWs, wslEnv, lastCursorHookEventAt)
+      logger.info(
+        'cursor-hook',
+        `Cursor hook ${enabled ? 'enabled' : 'disabled'} (${status.targetEnv}, installed=${status.installed}${status.error ? `, error=${status.error}` : ''})`
+      )
       return refresh({ force: true })
     }),
     orca.panels.handle('telemetry.updateSettings', async (input) => {
@@ -444,16 +468,16 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
     for (const d of disposables) {
       d.dispose()
     }
+    void logger.flush()
   }
 
-  // Initial lightweight warm-up only when status bar is enabled (never fail activation if host denies).
   try {
     const cfg = await readSettings()
     if (cfg.display.showStatusBar) {
       await refresh({ force: false })
     }
   } catch (error) {
-    orca.log(`Initial telemetry refresh warning: ${error instanceof Error ? error.message : String(error)}`)
+    logger.warn('worker', `Initial refresh warning: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
 

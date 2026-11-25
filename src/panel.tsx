@@ -185,6 +185,7 @@ export default function Panel() {
       <TokensAndSpeedCard snap={snap} />
       <GitCard snap={snap} />
       <ControlsCard snap={snap} busy={busy} />
+      <DiagnosticsCard snap={snap} />
     </Stack>
   )
 }
@@ -203,10 +204,15 @@ function AgentHeaderCard({ snap }: { snap: TelemetrySnapshot }) {
     )
   }
 
-  const selectOptions = snap.agents.map((a) => ({
-    value: a.key,
-    label: `${a.agent}${a.title ? ` — ${a.title}` : ''} (${stateText(a.state)})`
-  }))
+  const selectOptions = snap.agents.map((a) => {
+    const labelName = a.title ?? a.taskTitle ?? (a.prompt ? a.prompt.slice(0, 24) : null)
+    return {
+      value: a.key,
+      label: `${a.agent}${labelName ? ` · ${labelName}` : ''} (${stateText(a.state)})`
+    }
+  })
+
+  const subLabel = active.taskTitle ?? active.title ?? active.prompt
 
   return (
     <Box direction="column" gap="xs" padding="sm" border radius="md" background="card">
@@ -235,9 +241,9 @@ function AgentHeaderCard({ snap }: { snap: TelemetrySnapshot }) {
           {snap.sourceLabel}
         </Badge>
       </Row>
-      {active.taskTitle ? (
+      {subLabel ? (
         <Text size="xs" muted truncate>
-          {active.taskTitle}
+          {subLabel}
         </Text>
       ) : null}
     </Box>
@@ -478,6 +484,36 @@ function ControlsCard({ snap, busy }: { snap: TelemetrySnapshot; busy: boolean }
         />
       </Stack>
     </Card>
+  )
+}
+
+function DiagnosticsCard({ snap }: { snap: TelemetrySnapshot }) {
+  const wsPath = snap.workspace.linuxPath ?? snap.workspace.windowsPath ?? snap.workspace.rawPath ?? 'none'
+  return (
+    <Collapsible title="Diagnostics & Logs" defaultOpen={false}>
+      <Stack gap="xs">
+        <KeyValue
+          label="Paths"
+          items={[
+            { label: 'Workspace', value: wsPath, code: true },
+            { label: 'Log File', value: snap.logPath ?? 'none', code: true }
+          ]}
+        />
+        {snap.diagnostics.length > 0 ? (
+          <Stack gap="none">
+            {snap.diagnostics.slice(-8).map((line, i) => (
+              <Text key={`${i}:${line.slice(0, 24)}`} size="xs" muted truncate>
+                {line}
+              </Text>
+            ))}
+          </Stack>
+        ) : (
+          <Text size="xs" muted>
+            No diagnostic log entries yet.
+          </Text>
+        )}
+      </Stack>
+    </Collapsible>
   )
 }
 

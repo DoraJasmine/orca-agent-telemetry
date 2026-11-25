@@ -1,6 +1,16 @@
 import * as path from 'node:path'
 import type { ToolCount } from '../protocol'
-import { fileExists, findMatchingFiles } from './fs-lookup'
+import {
+  agentActivityTimestamp,
+  buildPromptSnippet,
+  buildWorkspacePathSet,
+  fileExists,
+  findMatchingFiles,
+  normalizePathForCompare,
+  pickClosestFileByTimestamp,
+  readHeadUtf8,
+  readTailUtf8
+} from './fs-lookup'
 import { resolveContextWindow } from './model-windows'
 import { JsonlTailer, parseIsoTimestampMs, safeJsonParse } from './tailer'
 import type { AdapterContext, AdapterResult, ParsedTurn } from './types'
@@ -97,7 +107,6 @@ export function ingestAgyLine(line: string, state: AgyParseState, observedAtMs: 
     }
     if (contextUsed > 0) state.lastContextUsed = contextUsed
 
-    // During live tailing, `observedAtMs` is close to completion while `created_at` marks step start.
     const liveDelta = observedAtMs - ts
     const fallbackDelta =
       state.lastStepAtMs !== null && ts > state.lastStepAtMs ? ts - state.lastStepAtMs : null
@@ -127,15 +136,25 @@ export function ingestAgyLine(line: string, state: AgyParseState, observedAtMs: 
 
 export class AgyAdapter {
   private readonly tailer = new JsonlTailer<AgyParseState>()
-  private readonly pathBySession = new Map<string, string>()
+  private readonly pathByAgentKey = new Map<string, string>()
 
   async collect(ctx: AdapterContext): Promise<AdapterResult | null> {
     const logPath = await this.locateTranscriptFile(ctx)
-    if (!logPath) return null
+    if (!logPath) {
+      ctx.logger?.logOnce(
+        `agy-miss:${ctx.agent.key}`,
+        'INFO',
+        'agy',
+        `No transcript.jsonl matched for key=${ctx.agent.key} sessionId=${ctx.agent.sessionId ?? 'none'}`
+      )
+      return null
+    }
+
+    ctx.logger?.logOnce(`agy-hit:${ctx.agent.key}`, 'INFO', 'agy', `Using transcript: ${logPath}`)
 
     const res = await this.tailer.readIncremental(logPath, createAgyState, ingestAgyLine)
     if (!res.exists) {
-      if (ctx.agent.sessionId) this.pathBySession.delete(ctx.agent.sessionId)
+      this.pathByAgentKey.delete(ctx.agent.key)
       return null
     }
 
@@ -157,43 +176,121 @@ export class AgyAdapter {
   }
 
   private async locateTranscriptFile(ctx: AdapterContext): Promise<string | null> {
+    const cacheKey = ctx.agent.key
+    const cached = this.pathByAgentKey.get(cacheKey)
+    if (cached) return cached
+
     const sid = ctx.agent.sessionId
-    if (sid) {
-      const cached = this.pathBySession.get(sid)
-      if (cached) return cached
-    }
+    const targetPaths = buildWorkspacePathSet(ctx.workspace)
+    const promptHint = buildPromptSnippet(ctx.agent.prompt)
+    const targetMs = agentActivityTimestamp(ctx.agent)
 
-    const brainBases: string[] = []
+    const bases: { baseDir: string; brainDir: string }[] = []
     for (const root of ctx.homeRoots) {
-      brainBases.push(path.join(root.homeWin, '.gemini', 'antigravity-cli', 'brain'))
-      brainBases.push(path.join(root.homeWin, '.gemini', 'antigravity', 'brain'))
-      brainBases.push(path.join(root.homeWin, '.gemini', 'antigravity-chat', 'antigravity-acp', 'brain'))
+      for (const sub of ['antigravity-cli', 'antigravity', 'antigravity-chat/antigravity-acp']) {
+        const baseDir = path.join(root.homeWin, '.gemini', sub)
+        bases.push({ baseDir, brainDir: path.join(baseDir, 'brain') })
+      }
     }
 
-    for (const brainDir of brainBases) {
-      if (!(await fileExists(brainDir))) continue
-
-      if (sid) {
+    // Tier 1: Direct sessionId match.
+    if (sid) {
+      for (const { brainDir } of bases) {
         const direct = path.join(brainDir, sid, '.system_generated', 'logs', 'transcript.jsonl')
         if (await fileExists(direct)) {
-          this.pathBySession.set(sid, direct)
+          this.pathByAgentKey.set(cacheKey, direct)
           return direct
+        }
+      }
+    }
+
+    // Tier 2: Lookup in `history.jsonl` by workspace path + prompt/timestamp (handles Orca Native Chat UUIDs).
+    for (const { baseDir, brainDir } of bases) {
+      const historyFile = path.join(baseDir, 'history.jsonl')
+      if (!(await fileExists(historyFile))) continue
+      const convId = await this.lookupInHistory(historyFile, targetPaths, promptHint, targetMs)
+      if (convId) {
+        const candidate = path.join(brainDir, convId, '.system_generated', 'logs', 'transcript.jsonl')
+        if (await fileExists(candidate)) {
+          this.pathByAgentKey.set(cacheKey, candidate)
+          return candidate
+        }
+      }
+    }
+
+    // Tier 3: Bounded scan of recent `transcript.jsonl` matching prompt snippet or close timestamp.
+    for (const { brainDir } of bases) {
+      if (!(await fileExists(brainDir))) continue
+      const recent = await findMatchingFiles(
+        brainDir,
+        (name, fullPath) => name === 'transcript.jsonl' && fullPath.includes('.system_generated'),
+        { maxDepth: 4, maxDirs: 80, descendingDirs: true }
+      )
+      if (recent.length === 0) continue
+
+      if (promptHint) {
+        for (const f of recent.slice(0, 12)) {
+          const head = await readHeadUtf8(f.path, 4096)
+          if (head.includes(promptHint)) {
+            this.pathByAgentKey.set(cacheKey, f.path)
+            return f.path
+          }
         }
       }
 
       if (ctx.agent.state === 'working') {
-        const recent = await findMatchingFiles(
-          brainDir,
-          (name, fullPath) => name === 'transcript.jsonl' && fullPath.includes('.system_generated'),
-          { maxDepth: 4, maxDirs: 80, descendingDirs: true }
-        )
-        if (recent[0] && Date.now() - recent[0].mtimeMs < 120_000) {
-          return recent[0].path
+        const best = pickClosestFileByTimestamp(recent, targetMs, 15 * 60_000)
+        if (best) {
+          this.pathByAgentKey.set(cacheKey, best.path)
+          return best.path
         }
       }
     }
 
     return null
+  }
+
+  private async lookupInHistory(
+    historyFile: string,
+    targetPaths: Set<string>,
+    promptHint: string | null,
+    targetMs: number
+  ): Promise<string | null> {
+    const tail = await readTailUtf8(historyFile, 128 * 1024)
+    if (!tail) return null
+
+    type HistoryRow = {
+      display?: string
+      timestamp?: number | string
+      workspace?: string
+      conversationId?: string
+    }
+
+    const candidates: { conversationId: string; score: number; ts: number }[] = []
+
+    for (const line of tail.split(/\r?\n/)) {
+      const row = safeJsonParse<HistoryRow>(line.trim())
+      if (!row?.conversationId) continue
+
+      const ws = normalizePathForCompare(row.workspace)
+      if (targetPaths.size > 0 && ws && !targetPaths.has(ws)) continue
+
+      const rowTs = parseIsoTimestampMs(row.timestamp) ?? 0
+      let score = ws && targetPaths.has(ws) ? 20 : 1
+      if (promptHint && typeof row.display === 'string' && row.display.includes(promptHint)) {
+        score += 50
+      }
+      if (targetMs > 0 && rowTs > 0) {
+        const delta = Math.abs(rowTs - targetMs)
+        if (delta < 120_000) score += 25
+        else if (delta < 3600_000) score += 10
+      }
+      candidates.push({ conversationId: row.conversationId, score, ts: rowTs })
+    }
+
+    if (candidates.length === 0) return null
+    candidates.sort((a, b) => (b.score !== a.score ? b.score - a.score : b.ts - a.ts))
+    return candidates[0].conversationId
   }
 }
 

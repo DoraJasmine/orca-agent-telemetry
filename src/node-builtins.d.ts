@@ -9,6 +9,7 @@ declare class Buffer {
   static alloc(size: number): Buffer
   static concat(list: readonly Uint8Array[], totalLength?: number): Buffer
   static from(data: string | Uint8Array, encoding?: string): Buffer
+  includes(value: number): boolean
   subarray(start?: number, end?: number): Buffer
   toString(encoding?: string, start?: number, end?: number): string
 }
@@ -71,6 +72,7 @@ declare module 'node:fs/promises' {
   export function readFile(path: string): Promise<Buffer>
   export function writeFile(path: string, data: string, encoding?: 'utf8'): Promise<void>
   export function appendFile(path: string, data: string, encoding?: 'utf8'): Promise<void>
+  export function rename(oldPath: string, newPath: string): Promise<void>
   export function mkdir(path: string, options?: { recursive?: boolean }): Promise<string | undefined>
   export function mkdtemp(prefix: string): Promise<string>
   export function rm(path: string, options?: { recursive?: boolean; force?: boolean }): Promise<void>
@@ -91,6 +93,10 @@ declare module 'node:child_process' {
     file: string,
     args: readonly string[],
     options: ExecFileOptions,
-    callback: (error: (Error & { code?: number | string }) | null, stdout: string, stderr: string) => void
+    callback: (
+      error: (Error & { code?: number | string }) | null,
+      stdout: string | Buffer,
+      stderr: string | Buffer
+    ) => void
   ): void
 }

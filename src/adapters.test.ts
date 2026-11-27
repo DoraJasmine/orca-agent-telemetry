@@ -530,7 +530,7 @@ test('kimi adapter prefers recent session_1* over older session_9* in session_in
   }
 })
 
-test('agy parser handles PLANNER_RESPONSE tokens and step completion timing', () => {
+test('agy parser handles PLANNER_RESPONSE tokens, uncached inputs, compaction, and step completion timing', () => {
   const state = createAgyState()
   ingestAgyLine(
     JSON.stringify({
@@ -538,15 +538,16 @@ test('agy parser handles PLANNER_RESPONSE tokens and step completion timing', ()
       source: 'MODEL',
       type: 'PLANNER_RESPONSE',
       status: 'DONE',
-      created_at: '2026-11-25T03:26:58Z',
-      model: 'gemini-4-hydrogen-high',
-      input_tokens: 16_016,
-      cache_read_tokens: 8_000,
-      output_tokens: 300,
+      created_at: '2026-11-27T01:24:06Z',
+      model: 'gemini-4-neon-xhigh',
+      input_tokens: 162_390,
+      cache_read_tokens: 0,
+      output_tokens: 611,
       tool_calls: [{ name: 'run_command', args: {} }]
     }),
     state,
-    Date.parse('2026-11-25T03:26:58Z')
+    Date.parse('2026-11-27T01:24:20Z'),
+    { isInitialRead: true }
   )
   ingestAgyLine(
     JSON.stringify({
@@ -554,16 +555,72 @@ test('agy parser handles PLANNER_RESPONSE tokens and step completion timing', ()
       source: 'MODEL',
       type: 'GENERIC',
       status: 'DONE',
-      created_at: '2026-11-25T03:27:01Z'
+      created_at: '2026-11-27T01:24:14Z'
     }),
     state,
-    Date.parse('2026-11-25T03:27:01Z')
+    Date.parse('2026-11-27T01:24:20Z'),
+    { isInitialRead: true }
+  )
+  // Cached turn where `input_tokens` < `cache_read_tokens` must NOT zero out `inputUncached` or trigger `compactedDetected`.
+  ingestAgyLine(
+    JSON.stringify({
+      step_index: 3,
+      source: 'MODEL',
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-11-27T01:24:17Z',
+      model: 'gemini-4-neon-xhigh',
+      input_tokens: 2_881,
+      cache_read_tokens: 162_391,
+      output_tokens: 49
+    }),
+    state,
+    Date.parse('2026-11-27T01:24:20Z'),
+    { isInitialRead: true }
+  )
+  // Subsequent user input later on must not attribute user idle time as generation duration.
+  ingestAgyLine(
+    JSON.stringify({
+      step_index: 4,
+      source: 'USER_EXPLICIT',
+      type: 'USER_INPUT',
+      status: 'DONE',
+      created_at: '2026-11-27T01:26:17Z'
+    }),
+    state,
+    Date.parse('2026-11-27T01:26:20Z'),
+    { isInitialRead: true }
+  )
+  // Real compaction: total context drops from 165,321 to 29,189 (< 60%).
+  ingestAgyLine(
+    JSON.stringify({
+      step_index: 5,
+      source: 'MODEL',
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-11-27T01:26:18Z',
+      model: 'gemini-4-neon-xhigh',
+      input_tokens: 28_721,
+      cache_read_tokens: 0,
+      output_tokens: 468
+    }),
+    state,
+    Date.parse('2026-11-27T01:26:23Z'),
+    { isInitialRead: false }
   )
 
-  assert.equal(state.turns.length, 1)
-  assert.equal(state.turns[0].inputUncached, 8_016)
-  assert.equal(state.turns[0].cacheRead, 8_000)
-  assert.equal(state.turns[0].durationMs, 3_000)
+  assert.equal(state.turns.length, 3)
+  assert.equal(state.turns[0].inputUncached, 162_390)
+  assert.equal(state.turns[0].cacheRead, 0)
+  assert.equal(state.turns[0].contextUsed, 163_001)
+  assert.equal(state.turns[0].durationMs, 8_000)
+  assert.equal(state.turns[1].inputUncached, 2_881)
+  assert.equal(state.turns[1].cacheRead, 162_391)
+  assert.equal(state.turns[1].contextUsed, 165_321)
+  assert.equal(state.turns[1].durationMs, null)
+  assert.equal(state.turns[2].contextUsed, 29_189)
+  assert.equal(state.turns[2].durationMs, 5_000)
+  assert.equal(state.compactedDetected, true)
   assert.equal(state.tools.get('run_command')?.count, 1)
 })
 
@@ -798,7 +855,7 @@ test('adapters locate Native Chat logs via cwd, index, history, and prompt hints
       })
     )
     assert.ok(agyRes)
-    assert.equal(agyRes.contextUsed, 9_250)
+    assert.equal(agyRes.contextUsed, 13_250)
 
     // 4. Cursor matched via case-preserving WSL slug + prompt hint
     const cursorTxDir = path.join(
@@ -878,5 +935,116 @@ test('incremental tailer reads appended UTF-8 lines without duplicating prior by
     assert.deepEqual(second.state, [1, 2, 3])
   } finally {
     await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('agy adapter ignores stale workspace history rows and matches Native Chat via title/prompt head+tail', async () => {
+  const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), 'orca-agy-native-'))
+  try {
+    const agyBase = path.join(homeDir, '.gemini', 'antigravity-cli')
+    const oldLogDir = path.join(agyBase, 'brain', '071667da-stale', '.system_generated', 'logs')
+    const newLogDir = path.join(agyBase, 'brain', 'bb992ce8-active', '.system_generated', 'logs')
+    await fs.mkdir(oldLogDir, { recursive: true })
+    await fs.mkdir(newLogDir, { recursive: true })
+
+    const nowMs = Date.now()
+    const staleMs = nowMs - 3 * 24 * 3_600_000
+
+    // Stale session present in `history.jsonl` for the same workspace.
+    const staleTranscript = path.join(oldLogDir, 'transcript.jsonl')
+    await fs.writeFile(
+      staleTranscript,
+      JSON.stringify({
+        step_index: 1,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        created_at: new Date(staleMs).toISOString(),
+        model: 'gemini-4-hydrogen-high',
+        input_tokens: 2_893,
+        cache_read_tokens: 432_002,
+        output_tokens: 1_660
+      }) + '\n',
+      'utf8'
+    )
+    await fs.utimes(staleTranscript, new Date(staleMs), new Date(staleMs))
+    await fs.writeFile(
+      path.join(agyBase, 'history.jsonl'),
+      JSON.stringify({
+        display: '老会话提示词',
+        timestamp: staleMs,
+        workspace: '/home/dora/lyfLearn/3dGS/compareExp',
+        conversationId: '071667da-stale'
+      }) + '\n',
+      'utf8'
+    )
+
+    // Active Native Chat session absent from `history.jsonl`, with initial title in head and latest prompt in tail.
+    const activeTranscript = path.join(newLogDir, 'transcript.jsonl')
+    await fs.writeFile(
+      activeTranscript,
+      [
+        JSON.stringify({
+          step_index: 0,
+          source: 'USER_EXPLICIT',
+          type: 'USER_INPUT',
+          created_at: new Date(nowMs - 60_000).toISOString(),
+          content: '<USER_REQUEST>\n你看看Seq26手部模糊修复文件夹中的内容和最新实验方案与报告，熟悉本项目\n</USER_REQUEST>'
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          created_at: new Date(nowMs - 55_000).toISOString(),
+          model: 'gemini-4-neon-xhigh',
+          input_tokens: 506_939,
+          cache_read_tokens: 0,
+          output_tokens: 1_762,
+          content: 'padding-' + 'x'.repeat(12_000)
+        }),
+        JSON.stringify({
+          step_index: 2,
+          source: 'USER_EXPLICIT',
+          type: 'USER_INPUT',
+          created_at: new Date(nowMs - 15_000).toISOString(),
+          content: '<USER_REQUEST>\n你先将路线A的详细实验方案文档写出来\n</USER_REQUEST>'
+        }),
+        JSON.stringify({
+          step_index: 3,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          created_at: new Date(nowMs - 12_000).toISOString(),
+          model: 'gemini-4-neon-xhigh',
+          input_tokens: 2_181,
+          cache_read_tokens: 506_725,
+          output_tokens: 438
+        })
+      ].join('\n') + '\n',
+      'utf8'
+    )
+    await fs.utimes(activeTranscript, new Date(nowMs - 5_000), new Date(nowMs - 5_000))
+
+    const res = await new AgyAdapter().collect(
+      makeAdapterCtx(homeDir, {
+        key: 'agy-active-native',
+        agent: 'antigravity',
+        sessionId: '4692c8fe-orca-session',
+        title: '你看看Seq26手部模糊修复文件夹中的内容和最新实验方案与报告…',
+        prompt: '你先将路线A的详细实验方案文档写出来 [Image #1]',
+        state: 'working',
+        stateStartedAt: nowMs - 15_000,
+        updatedAt: nowMs - 3_000
+      })
+    )
+    assert.ok(res)
+    assert.ok(res.logPath?.includes('bb992ce8-active'))
+    assert.equal(res.model, 'gemini-4-neon-xhigh')
+    assert.equal(res.contextUsed, 509_344)
+    assert.equal(res.compactedDetected, false)
+    const metrics = computeMetrics({ adapter: res, showEstimatedCost: true })
+    assert.equal(metrics.tokens.inputUncached, 509_120)
+    assert.equal(metrics.tokens.cacheRead, 506_725)
+    assert.equal(metrics.tokens.output, 2_200)
+  } finally {
+    await fs.rm(homeDir, { recursive: true, force: true })
   }
 })

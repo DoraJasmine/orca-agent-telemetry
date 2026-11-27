@@ -59,11 +59,11 @@ Orca 在 **Native Chat** 或 **Paired WSL Environment** 下启动的会话，其
 
 ### 4. Antigravity（[src/adapters/agy.ts](../src/adapters/agy.ts)）
 
-- **检索路径**：依次检索 `<home>/.gemini/{antigravity-cli,antigravity,antigravity-chat/antigravity-acp}/`，优先按 `sessionId` 匹配 `brain/<id>/.system_generated/logs/transcript.jsonl`，其次经由 `history.jsonl`（匹配 `workspace`、`display`、`timestamp`）定位 `conversationId`，最后在 `.system_generated` 下按时间邻近回退。
+- **检索路径**：依次检索 `<home>/.gemini/{antigravity-cli,antigravity,antigravity-chat/antigravity-acp}/`，优先按 `sessionId` 匹配 `brain/<id>/.system_generated/logs/transcript.jsonl`；未命中时，将 `history.jsonl`（`workspace`、`display`、`timestamp`）与按 `mtimeMs` 排序的 `brain/*/.system_generated/logs/transcript.jsonl` 联合打分，同时结合 `agent.title`（头部前 `8 KB`）与 `agent.prompt`（尾部 `64 KB`，自动剥离 `[Image #N]` 与尾部省略号 `…`）匹配，避免仅因同工作区旧会话存在于 `history.jsonl` 而劫持未写 `history.jsonl` 的 Native Chat 新会话。
 - **日志 Schema**：
   - 通过 `step_index` 严格去重。
-  - 解析 `PLANNER_RESPONSE` / `source === 'MODEL'` 的用量记录，处理厂商计数差异：Anthropic 模型（`/claude/i`）的 `input_tokens` **不含**缓存，因此 `contextUsed = input_tokens + cache_read_tokens + output_tokens`；Gemini 模型的 `input_tokens` **已包含**缓存读取部分，因此 `inputUncached = max(0, input_tokens - cache_read_tokens)`、`contextUsed = input_tokens + output_tokens`。
-  - 当单条记录 `created_at` 与观测时间差在 `(200ms, 600s]` 之外时，等待下一步的 `created_at` 自动修正前一步的 `durationMs`。
+  - 解析 `PLANNER_RESPONSE` / `source === 'MODEL'` 的用量记录。Antigravity `transcript.jsonl` 无论 Gemini 还是 Anthropic 模型，`input_tokens` 均仅表示**未命中缓存的新增输入**（不含 `cache_read_tokens`），因此统一按 `inputUncached = input_tokens`、`contextUsed = input_tokens + cache_read_tokens + output_tokens` 核算，防止命中缓存时新增输入归零或误触发 `Compacted`。
+  - 生成耗时优先取当前 `PLANNER_RESPONSE`（开始时间）与紧随其后的 `GENERIC` (`source === 'MODEL'`) 工具调用步骤（生成结束边界）的时间差（排除 `USER_INPUT` 等待人机交互的空闲时长），增量 tail 实时抵达且无工具调用的轮次则采用 `observedAtMs - created_at`。
 
 ### 5. Cursor（[src/adapters/cursor.ts](../src/adapters/cursor.ts), [src/helpers/cursor-hook.ts](../src/helpers/cursor-hook.ts)）
 

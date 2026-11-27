@@ -2,7 +2,7 @@
 
 Orca 右侧边栏与状态栏 Agent 遥测插件（`dorajasmine.agent-telemetry`），专为 **Windows 本机运行 Orca 客户端 + 连接 WSL / 本机工作区** 场景打造，实时呈现当前活跃或选中 Agent 会话的 **上下文窗口占用、Token 明细、生成速率（`tok/s`）、估算 API 成本与 Git 状态**。
 
-> 当前版本：`0.2.2` · 最低 Orca 版本：`>= 1.4.259` · 运行模式：`trusted-worker` + 零外链 CSP-safe HTML 面板
+> 当前版本：`0.2.3` · 最低 Orca 版本：`>= 1.4.259` · 运行模式：`trusted-worker` + 零外链 CSP-safe HTML 面板
 
 ## 支持的 Agent 与数据源
 
@@ -11,7 +11,7 @@ Orca 右侧边栏与状态栏 Agent 遥测插件（`dorajasmine.agent-telemetry`
 | **Claude Code** (`claude`) | `~/.claude/projects/<slug>/<session>.jsonl`（按 `message.id` 去重，读取 `settings.json` 中的 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`） | `sessionId`、`~/.claude/history.jsonl`、目录 slug / 头部 `cwd` 前缀、首条提示词与 mtime | Orca `agent.listSessions` |
 | **Kimi Code / CLI** (`kimi`) | 新版 `~/.kimi-code/sessions/.../wire.jsonl`（`usage.record` `turn` 作用域、`profile.bind.modelAlias`、`token_counting.measured`，读取 `config.toml` `max_context_size`）与旧版 `.kimi/sessions/.../wire.jsonl`（`StatusUpdate`） | `session_index.jsonl`（跳过 `deleted: true` 墓碑）、`state.json`（`cwd`/`title`/`lastPrompt`/`updatedAt`）、`wire.jsonl` 真实 mtime 与头尾提示词 | Orca `agent.listSessions` |
 | **Codex** (`codex`) | `~/.codex/sessions/**/rollout-*.jsonl`（`last_token_usage` / `total_token_usage` / `model_context_window`，已对 `rate_limits` 重复行去重，避免 `reasoning` 重复计入输出） | `session_meta.payload.cwd`（支持超 `64 KB` 截断回退正则提取）、提示词与 `mtimeMs` | Orca `agent.listSessions` |
-| **Antigravity** (`antigravity` / `agy`) | `~/.gemini/{antigravity-cli,antigravity,antigravity-chat/antigravity-acp}/brain/<id>/.system_generated/logs/transcript.jsonl`（`PLANNER_RESPONSE` / `step_index` 去重） | `history.jsonl`、`workspace` 路径、提示词与时间邻近度 | Orca `agent.listSessions` |
+| **Antigravity** (`antigravity` / `agy`) | `~/.gemini/{antigravity-cli,antigravity,antigravity-chat/antigravity-acp}/brain/<id>/.system_generated/logs/transcript.jsonl`（`PLANNER_RESPONSE` / `step_index` 去重，按 `input_tokens + cache_read_tokens + output_tokens` 核算上下文） | `history.jsonl`、按 `mtimeMs` 排序的 `brain/*` 头部 `title` / 尾部 `prompt` 联合评分 | Orca `agent.listSessions` |
 | **Cursor** (`cursor`) | 开启 **Cursor Hook 精确统计** 后，通过 `~/.cursor/hooks.json` 写入 `~/.orca-telemetry/cursor-usage.jsonl`（`generation_id` 去重，扣除含 cache 重复项） | `session_id`、`workspace_roots`、大小写 Slug 下的 `agent-transcripts/*.jsonl` | Transcript 字符估算（`≈ 3.8 chars/token`）+ Orca `agent.listSessions` |
 
 ## 核心功能
@@ -121,4 +121,4 @@ orca-agent-telemetry/
 - [适配器与数据源规范 (`docs/adapters.md`)](./docs/adapters.md) — Native Chat 跨 UUID 会话匹配原理、5 大 Agent 的日志 Schema/去重细节、模型窗口解析优先级，以及新增 Agent 适配器的完整指南。
 - [指标核算、UI 与配置规范 (`docs/metrics-and-ui.md`)](./docs/metrics-and-ui.md) — `tok/s` 速率与推理 Token 精确口径、设置项格式（含 `contextWindowOverride`）、CSP-safe HTML 面板约定与交互状态持久性。
 - [开发、测试、排障与发版指南 (`docs/development.md`)](./docs/development.md) — 本地搭建、PowerShell / WSL 脚本注意事项、日志诊断手册、单测规范、常见故障排查 Playbook 与发版 CheckList。
-- [变更日志 (`CHANGELOG.md`)](./CHANGELOG.md) — `v0.1.0` 至 `v0.2.2` 的完整迭代记录。
+- [变更日志 (`CHANGELOG.md`)](./CHANGELOG.md) — `v0.1.0` 至 `v0.2.3` 的完整迭代记录。

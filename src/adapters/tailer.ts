@@ -20,7 +20,12 @@ export class JsonlTailer<S> {
   async readIncremental(
     filePath: string,
     createInitialState: () => S,
-    onLine: (line: string, state: S, observedAtMs: number) => void
+    onLine: (
+      line: string,
+      state: S,
+      observedAtMs: number,
+      meta?: { isInitialRead: boolean }
+    ) => void
   ): Promise<{ state: S; updated: boolean; exists: boolean }> {
     let statResult: { size: number; mtimeMs: number }
     try {
@@ -51,6 +56,7 @@ export class JsonlTailer<S> {
       return { state: entry.state, updated: false, exists: true }
     }
 
+    const isInitialRead = entry.offset === 0
     const bytesAvailable = statResult.size - entry.offset
     const toRead = Math.min(bytesAvailable, MAX_READ_BYTES_PER_PASS)
     const buffer = Buffer.alloc(toRead)
@@ -80,7 +86,7 @@ export class JsonlTailer<S> {
       const chunkText = slice.subarray(0, consumedBytes).toString('utf8')
       for (const rawLine of chunkText.split(/\r?\n/)) {
         const trimmed = rawLine.trim()
-        if (trimmed) onLine(trimmed, entry.state, observedAtMs)
+        if (trimmed) onLine(trimmed, entry.state, observedAtMs, { isInitialRead })
       }
     } else if (entry.offset + bytesRead === statResult.size) {
       // Handle a single complete JSON line written without a trailing newline.
@@ -88,7 +94,7 @@ export class JsonlTailer<S> {
       if (candidate.startsWith('{') && candidate.endsWith('}')) {
         try {
           JSON.parse(candidate)
-          onLine(candidate, entry.state, observedAtMs)
+          onLine(candidate, entry.state, observedAtMs, { isInitialRead })
           consumedBytes = bytesRead
         } catch {
           // Wait until the full line finishes flushing.

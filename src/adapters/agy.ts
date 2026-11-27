@@ -1,13 +1,11 @@
+import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
-import type { ToolCount } from '../protocol'
+import type { AgentOption, ToolCount } from '../protocol'
 import {
   agentActivityTimestamp,
-  buildPromptSnippet,
   buildWorkspacePathSet,
   fileExists,
-  findMatchingFiles,
   normalizePathForCompare,
-  pickClosestFileByTimestamp,
   readHeadUtf8,
   readTailUtf8
 } from './fs-lookup'
@@ -20,7 +18,8 @@ export type AgyParseState = {
   lastContextUsed: number | null
   compactedDetected: boolean
   seenSteps: Set<number>
-  lastStepAtMs: number | null
+  pendingTurnEnd: boolean
+  pendingTurnHasToolCalls: boolean
   turns: ParsedTurn[]
   tools: Map<string, ToolCount>
 }
@@ -31,13 +30,19 @@ export function createAgyState(): AgyParseState {
     lastContextUsed: null,
     compactedDetected: false,
     seenSteps: new Set(),
-    lastStepAtMs: null,
+    pendingTurnEnd: false,
+    pendingTurnHasToolCalls: false,
     turns: [],
     tools: new Map()
   }
 }
 
-export function ingestAgyLine(line: string, state: AgyParseState, observedAtMs: number): void {
+export function ingestAgyLine(
+  line: string,
+  state: AgyParseState,
+  observedAtMs: number,
+  meta?: { isInitialRead: boolean }
+): void {
   const obj = safeJsonParse<Record<string, unknown>>(line)
   if (!obj) return
 
@@ -51,25 +56,32 @@ export function ingestAgyLine(line: string, state: AgyParseState, observedAtMs: 
   const type = typeof obj.type === 'string' ? obj.type : ''
   const source = typeof obj.source === 'string' ? obj.source : ''
 
-  // If the previous planner turn had no explicit end timestamp yet, refine duration using this step's created_at.
-  if (state.turns.length > 0) {
+  // In Antigravity transcripts, `PLANNER_RESPONSE.created_at` marks when the LLM turn started,
+  // while the subsequent `GENERIC` (`source: "MODEL"`) step marks when tool execution started
+  // (i.e. right after model generation finished). Avoid counting user think time on `USER_INPUT`.
+  if (state.pendingTurnEnd && state.turns.length > 0) {
     const prevTurn = state.turns[state.turns.length - 1]
+    const isBoundaryEnd = type !== 'USER_INPUT' && type !== 'CHECKPOINT'
     if (
-      prevTurn.durationMs === null &&
+      isBoundaryEnd &&
+      state.pendingTurnHasToolCalls &&
       prevTurn.timestampMs !== null &&
       ts > prevTurn.timestampMs &&
       ts - prevTurn.timestampMs <= 600_000
     ) {
       prevTurn.durationMs = ts - prevTurn.timestampMs
     }
+    state.pendingTurnEnd = false
+    state.pendingTurnHasToolCalls = false
   }
 
   if (typeof obj.model === 'string' && obj.model.length > 0) {
     state.model = obj.model
   }
 
-  if (Array.isArray(obj.tool_calls)) {
-    for (const tc of obj.tool_calls) {
+  const hasToolCalls = Array.isArray(obj.tool_calls) && obj.tool_calls.length > 0
+  if (hasToolCalls) {
+    for (const tc of obj.tool_calls as unknown[]) {
       if (tc && typeof tc === 'object' && typeof (tc as { name?: unknown }).name === 'string') {
         const name = (tc as { name: string }).name
         const prev = state.tools.get(name)
@@ -84,18 +96,16 @@ export function ingestAgyLine(line: string, state: AgyParseState, observedAtMs: 
     typeof obj.cache_read_tokens === 'number'
 
   if ((type === 'PLANNER_RESPONSE' || source === 'MODEL') && hasUsage) {
+    // Antigravity `transcript.jsonl` reports uncached `input_tokens` separately from
+    // `cache_read_tokens` across both Gemini and Anthropic models.
     const rawInput = readNumber(obj.input_tokens)
     const cacheRead = readNumber(obj.cache_read_tokens)
     const output = readNumber(obj.output_tokens)
     const thinking = readNumber(obj.thinking_tokens)
     const model = state.model
 
-    // Anthropic models report non-cached input separately; Gemini reports cached tokens inside prompt/input_tokens.
-    const isAnthropic = model ? /claude/i.test(model) : false
-    const inputUncached = isAnthropic ? rawInput : Math.max(0, rawInput - cacheRead)
-    const contextUsed = isAnthropic
-      ? rawInput + cacheRead + output
-      : rawInput + output
+    const inputUncached = rawInput
+    const contextUsed = rawInput + cacheRead + output
 
     if (
       contextUsed > 0 &&
@@ -107,15 +117,10 @@ export function ingestAgyLine(line: string, state: AgyParseState, observedAtMs: 
     }
     if (contextUsed > 0) state.lastContextUsed = contextUsed
 
+    const isIncremental = meta ? !meta.isInitialRead : false
     const liveDelta = observedAtMs - ts
-    const fallbackDelta =
-      state.lastStepAtMs !== null && ts > state.lastStepAtMs ? ts - state.lastStepAtMs : null
     const durationMs =
-      liveDelta > 150 && liveDelta <= 120_000
-        ? liveDelta
-        : fallbackDelta && fallbackDelta <= 600_000
-          ? fallbackDelta
-          : null
+      isIncremental && liveDelta > 150 && liveDelta <= 600_000 ? liveDelta : null
 
     state.turns.push({
       timestampMs: ts,
@@ -129,9 +134,47 @@ export function ingestAgyLine(line: string, state: AgyParseState, observedAtMs: 
       contextUsed: contextUsed > 0 ? contextUsed : null,
       contextLimit: null
     })
+    state.pendingTurnEnd = true
+    state.pendingTurnHasToolCalls = hasToolCalls
   }
+}
 
-  state.lastStepAtMs = ts
+export function buildAgyPromptHints(agent: AgentOption): string[] {
+  const out: string[] = []
+  const add = (raw: string | null | undefined): void => {
+    if (!raw) return
+    const firstLine = raw.trim().split(/\r?\n/)[0] ?? ''
+    const cleaned = firstLine
+      .replace(/\s*\[Image #\d+\].*$/i, '')
+      .replace(/(?:\.\.\.|…)+$/g, '')
+      .trim()
+    if (cleaned.length < 3) return
+    const snippet = cleaned.slice(0, 50).trim()
+    if (snippet.length >= 3 && !out.includes(snippet)) {
+      out.push(snippet)
+    }
+  }
+  add(agent.prompt)
+  add(agent.title)
+  add(agent.taskTitle)
+  return out
+}
+
+type HistorySummary = {
+  workspaceMatched: boolean
+  workspaceMismatch: boolean
+  promptMatched: boolean
+  latestTs: number
+}
+
+type AgyCandidate = {
+  convId: string
+  transcriptPath: string
+  mtimeMs: number
+  score: number
+  activityMs: number
+  promptMatched: boolean
+  confident: boolean
 }
 
 export class AgyAdapter {
@@ -178,18 +221,19 @@ export class AgyAdapter {
   private async locateTranscriptFile(ctx: AdapterContext): Promise<string | null> {
     const cacheKey = ctx.agent.key
     const cached = this.pathByAgentKey.get(cacheKey)
-    if (cached) return cached
+    if (cached && (await fileExists(cached))) return cached
+    if (cached) this.pathByAgentKey.delete(cacheKey)
 
     const sid = ctx.agent.sessionId
     const targetPaths = buildWorkspacePathSet(ctx.workspace)
-    const promptHint = buildPromptSnippet(ctx.agent.prompt)
+    const promptHints = buildAgyPromptHints(ctx.agent)
     const targetMs = agentActivityTimestamp(ctx.agent)
 
-    const bases: { baseDir: string; brainDir: string }[] = []
+    const bases: { baseDir: string; brainDir: string; rootEnv: 'wsl' | 'windows' }[] = []
     for (const root of ctx.homeRoots) {
       for (const sub of ['antigravity-cli', 'antigravity', 'antigravity-chat/antigravity-acp']) {
         const baseDir = path.join(root.homeWin, '.gemini', sub)
-        bases.push({ baseDir, brainDir: path.join(baseDir, 'brain') })
+        bases.push({ baseDir, brainDir: path.join(baseDir, 'brain'), rootEnv: root.env })
       }
     }
 
@@ -204,60 +248,123 @@ export class AgyAdapter {
       }
     }
 
-    // Tier 2: Lookup in `history.jsonl` by workspace path + prompt/timestamp (handles Orca Native Chat UUIDs).
-    for (const { baseDir, brainDir } of bases) {
-      const historyFile = path.join(baseDir, 'history.jsonl')
-      if (!(await fileExists(historyFile))) continue
-      const convId = await this.lookupInHistory(historyFile, targetPaths, promptHint, targetMs)
-      if (convId) {
-        const candidate = path.join(brainDir, convId, '.system_generated', 'logs', 'transcript.jsonl')
-        if (await fileExists(candidate)) {
-          this.pathByAgentKey.set(cacheKey, candidate)
-          return candidate
-        }
-      }
-    }
+    // Tier 2 & 3: Joint scoring across `history.jsonl` and mtime-ordered `brain/*/transcript.jsonl`
+    // so Native Chat sessions missing from `history.jsonl` are never hijacked by stale workspace logs.
+    let bestOverall: AgyCandidate | null = null
 
-    // Tier 3: Bounded scan of recent `transcript.jsonl` matching prompt snippet or close timestamp.
-    for (const { brainDir } of bases) {
-      if (!(await fileExists(brainDir))) continue
-      const recent = await findMatchingFiles(
-        brainDir,
-        (name, fullPath) => name === 'transcript.jsonl' && fullPath.includes('.system_generated'),
-        { maxDepth: 4, maxDirs: 80, descendingDirs: true }
-      )
-      if (recent.length === 0) continue
+    for (const { baseDir, brainDir, rootEnv } of bases) {
+      const historyMap = await this.readHistoryMap(path.join(baseDir, 'history.jsonl'), targetPaths, promptHints)
+      const filesByConv = await listBrainTranscripts(brainDir)
 
-      if (promptHint) {
-        for (const f of recent.slice(0, 12)) {
-          const head = await readHeadUtf8(f.path, 4096)
-          if (head.includes(promptHint)) {
-            this.pathByAgentKey.set(cacheKey, f.path)
-            return f.path
+      for (const convId of historyMap.keys()) {
+        if (!filesByConv.has(convId)) {
+          const candidatePath = path.join(brainDir, convId, '.system_generated', 'logs', 'transcript.jsonl')
+          const mtimeMs = await statMtimeMs(candidatePath)
+          if (mtimeMs > 0) {
+            filesByConv.set(convId, { convId, transcriptPath: candidatePath, mtimeMs })
           }
         }
       }
 
-      if (ctx.agent.state === 'working') {
-        const best = pickClosestFileByTimestamp(recent, targetMs, 15 * 60_000)
-        if (best) {
-          this.pathByAgentKey.set(cacheKey, best.path)
-          return best.path
+      if (filesByConv.size === 0) continue
+
+      const allItems = [...filesByConv.values()].filter((item) => !historyMap.get(item.convId)?.workspaceMismatch)
+      if (allItems.length === 0) continue
+
+      const shortlisted = shortlistAgyFiles(allItems, historyMap, targetMs, 24)
+      const envAffinityBonus =
+        (ctx.workspace.hostKind === 'wsl' && rootEnv === 'wsl') ||
+        (ctx.workspace.hostKind === 'local' && rootEnv === 'windows')
+          ? 15
+          : 0
+
+      const evaluated = await Promise.all(
+        shortlisted.map(async (item): Promise<AgyCandidate | null> => {
+          const hist = historyMap.get(item.convId)
+          let headMatched = false
+          let tailMatched = false
+          let promptMatched = Boolean(hist?.promptMatched)
+
+          if (promptHints.length > 0) {
+            const head = await readHeadUtf8(item.transcriptPath, 8192)
+            headMatched = matchesAnyHint(head, promptHints)
+            if (!headMatched || promptHints.length > 1) {
+              const tail = await readTailUtf8(item.transcriptPath, 65_536)
+              tailMatched = matchesAnyHint(tail, promptHints)
+            }
+            if (headMatched || tailMatched) {
+              promptMatched = true
+            }
+          }
+
+          const activityMs = Math.max(item.mtimeMs, hist?.latestTs ?? 0)
+          const delta = targetMs > 0 && activityMs > 0 ? Math.abs(activityMs - targetMs) : Infinity
+          const isFreshMtime = delta <= 120_000
+          const isWorkspaceMatch = Boolean(hist?.workspaceMatched)
+
+          const eligible =
+            promptMatched ||
+            (isWorkspaceMatch && (targetMs <= 0 || delta <= 3_600_000)) ||
+            (ctx.agent.state === 'working' && delta <= 15 * 60_000)
+          if (!eligible) return null
+
+          let score = envAffinityBonus
+          if (isWorkspaceMatch) score += 25
+          if (promptMatched) score += 80
+          if (headMatched && tailMatched && promptHints.length > 1) score += 20
+
+          if (delta <= 120_000) score += 45
+          else if (delta <= 900_000) score += 25
+          else if (delta <= 3_600_000) score += 10
+          else if (delta > 86_400_000 && Number.isFinite(delta)) score -= 40
+
+          return {
+            convId: item.convId,
+            transcriptPath: item.transcriptPath,
+            mtimeMs: item.mtimeMs,
+            score,
+            activityMs,
+            promptMatched,
+            confident: promptMatched || isFreshMtime
+          }
+        })
+      )
+
+      const valid = evaluated.filter((c): c is AgyCandidate => c !== null)
+      if (valid.length === 0) continue
+      valid.sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score
+        if (targetMs > 0) {
+          const diff = Math.abs(a.activityMs - targetMs) - Math.abs(b.activityMs - targetMs)
+          if (diff !== 0) return diff
         }
+        return b.activityMs - a.activityMs
+      })
+
+      const top = valid[0]
+      if (top.promptMatched) {
+        this.pathByAgentKey.set(cacheKey, top.transcriptPath)
+        return top.transcriptPath
+      }
+      if (!bestOverall || top.score > bestOverall.score) {
+        bestOverall = top
       }
     }
 
-    return null
+    if (bestOverall?.confident) {
+      this.pathByAgentKey.set(cacheKey, bestOverall.transcriptPath)
+    }
+    return bestOverall?.transcriptPath ?? null
   }
 
-  private async lookupInHistory(
+  private async readHistoryMap(
     historyFile: string,
     targetPaths: Set<string>,
-    promptHint: string | null,
-    targetMs: number
-  ): Promise<string | null> {
-    const tail = await readTailUtf8(historyFile, 128 * 1024)
-    if (!tail) return null
+    promptHints: string[]
+  ): Promise<Map<string, HistorySummary>> {
+    const out = new Map<string, HistorySummary>()
+    const tail = await readTailUtf8(historyFile, 256 * 1024)
+    if (!tail) return out
 
     type HistoryRow = {
       display?: string
@@ -266,32 +373,123 @@ export class AgyAdapter {
       conversationId?: string
     }
 
-    const candidates: { conversationId: string; score: number; ts: number }[] = []
-
     for (const line of tail.split(/\r?\n/)) {
       const row = safeJsonParse<HistoryRow>(line.trim())
       if (!row?.conversationId) continue
 
       const ws = normalizePathForCompare(row.workspace)
-      if (targetPaths.size > 0 && ws && !targetPaths.has(ws)) continue
-
+      const wsMatched = Boolean(ws && targetPaths.has(ws))
+      const wsOther = Boolean(targetPaths.size > 0 && ws && !targetPaths.has(ws))
       const rowTs = parseIsoTimestampMs(row.timestamp) ?? 0
-      let score = ws && targetPaths.has(ws) ? 20 : 1
-      if (promptHint && typeof row.display === 'string' && row.display.includes(promptHint)) {
-        score += 50
+      const promptMatched =
+        !wsOther &&
+        promptHints.length > 0 &&
+        typeof row.display === 'string' &&
+        promptHints.some((h) => row.display!.includes(h))
+
+      const prev = out.get(row.conversationId)
+      if (!prev) {
+        out.set(row.conversationId, {
+          workspaceMatched: wsMatched,
+          workspaceMismatch: wsOther,
+          promptMatched,
+          latestTs: rowTs
+        })
+      } else {
+        if (wsMatched) {
+          prev.workspaceMatched = true
+          prev.workspaceMismatch = false
+        }
+        if (promptMatched) prev.promptMatched = true
+        if (rowTs > prev.latestTs) prev.latestTs = rowTs
       }
-      if (targetMs > 0 && rowTs > 0) {
-        const delta = Math.abs(rowTs - targetMs)
-        if (delta < 120_000) score += 25
-        else if (delta < 3600_000) score += 10
-      }
-      candidates.push({ conversationId: row.conversationId, score, ts: rowTs })
     }
 
-    if (candidates.length === 0) return null
-    candidates.sort((a, b) => (b.score !== a.score ? b.score - a.score : b.ts - a.ts))
-    return candidates[0].conversationId
+    return out
   }
+}
+
+type BrainTranscriptEntry = {
+  convId: string
+  transcriptPath: string
+  mtimeMs: number
+}
+
+async function listBrainTranscripts(brainDir: string): Promise<Map<string, BrainTranscriptEntry>> {
+  const out = new Map<string, BrainTranscriptEntry>()
+  let entries
+  try {
+    entries = await fs.readdir(brainDir, { withFileTypes: true })
+  } catch {
+    return out
+  }
+
+  const checked = await Promise.all(
+    entries
+      .filter((e) => e.isDirectory())
+      .map(async (e): Promise<BrainTranscriptEntry | null> => {
+        const transcriptPath = path.join(brainDir, e.name, '.system_generated', 'logs', 'transcript.jsonl')
+        const mtimeMs = await statMtimeMs(transcriptPath)
+        return mtimeMs > 0 ? { convId: e.name, transcriptPath, mtimeMs } : null
+      })
+  )
+
+  for (const item of checked) {
+    if (item) out.set(item.convId, item)
+  }
+  return out
+}
+
+function shortlistAgyFiles(
+  items: BrainTranscriptEntry[],
+  historyMap: Map<string, HistorySummary>,
+  targetMs: number,
+  limit: number
+): BrainTranscriptEntry[] {
+  if (items.length <= limit) return items
+  const picked = new Set<BrainTranscriptEntry>()
+
+  for (const item of items) {
+    if (historyMap.get(item.convId)?.promptMatched) {
+      picked.add(item)
+    }
+  }
+
+  const byClosest = [...items].sort((a, b) =>
+    targetMs > 0
+      ? Math.abs(a.mtimeMs - targetMs) - Math.abs(b.mtimeMs - targetMs)
+      : b.mtimeMs - a.mtimeMs
+  )
+  for (const item of byClosest.slice(0, Math.max(limit - 6, 12))) {
+    picked.add(item)
+  }
+
+  const byNewest = [...items].sort((a, b) => b.mtimeMs - a.mtimeMs)
+  for (const item of byNewest) {
+    if (picked.size >= limit) break
+    picked.add(item)
+  }
+
+  return [...picked]
+}
+
+async function statMtimeMs(targetPath: string): Promise<number> {
+  try {
+    const st = await fs.stat(targetPath)
+    return st.mtimeMs
+  } catch {
+    return 0
+  }
+}
+
+function matchesAnyHint(text: string, hints: readonly string[]): boolean {
+  if (!text) return false
+  for (const h of hints) {
+    if (text.includes(h)) return true
+    const escaped = JSON.stringify(h).slice(1, -1)
+    if (escaped !== h && text.includes(escaped)) return true
+  }
+  return false
 }
 
 function readNumber(val: unknown): number {

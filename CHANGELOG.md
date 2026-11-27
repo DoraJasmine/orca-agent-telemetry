@@ -2,6 +2,13 @@
 
 本文件记录 `dorajasmine.agent-telemetry` 的主要版本演进（遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格）。
 
+## [0.2.3] - 2026-11-27
+
+### Fixed
+- **Antigravity Token 与上下文统计口径修复**：统一 `agy.ts` 对 Gemini 与 Anthropic 模型的解析逻辑——Antigravity `transcript.jsonl` 中的 `input_tokens` 仅代表未命中缓存的新增输入（不含 `cache_read_tokens`），改为统一按 `inputUncached = input_tokens` 与 `contextUsed = input_tokens + cache_read_tokens + output_tokens` 计算，解决上下文显示偏小（如 `4.6k`）、命中缓存时新增输入被扣成 `0` 及误报 `Compacted` 的问题。
+- **Antigravity 会话归因准确度修复**：重构 `locateTranscriptFile` 与 `readHistoryMap`，将 `history.jsonl` 与按真实 `mtimeMs` 排序的 `brain/*/.system_generated/logs/transcript.jsonl` 联合打分，同时结合 `agent.title`（头部 `8 KB`）与 `agent.prompt`（尾部 `64 KB`，自动清理 `[Image #N]` 与省略号 `…`）匹配，防止未写 `history.jsonl` 的 Native Chat 新会话被几天前同工作区的历史记录劫持锁死。
+- **Antigravity 生成速率计时修复**：`JsonlTailer` 透传 `isInitialRead` 标记，`ingestAgyLine` 改为结合 `PLANNER_RESPONSE` 与后续 `GENERIC` (`source: "MODEL"`) 步骤的时间差（排除 `USER_INPUT` 等待时间）计算生成耗时，避免同秒 `0s` 或前置步骤间隔造成的 `tok/s` 失真。
+
 ## [0.2.2] - 2026-11-25
 
 ### Fixed
